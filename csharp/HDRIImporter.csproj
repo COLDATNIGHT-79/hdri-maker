@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <RootNamespace>HDRIMaker.Unity</RootNamespace>
+    <AssemblyName>HDRIMaker.Unity</AssemblyName>
+    <Description>Unity Editor plugin for importing HDRI files created with HDRI Maker</Description>
+  </PropertyGroup>
+
+  <!-- 
+    NOTE: To use this in Unity, place HDRIImporter.cs in your Unity project's 
+    Assets/Editor/ folder. This .csproj is for standalone compilation/testing only.
+    Unity will compile it using its own build pipeline.
+  -->
+</Project>
