@@ -9,7 +9,8 @@ from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtCore import Qt, Signal, QPoint, QRect, QSize, QTimer
 from PySide6.QtGui import (
     QImage, QPainter, QColor, QPixmap, QCursor,
-    QMouseEvent, QWheelEvent, QPaintEvent, QResizeEvent
+    QMouseEvent, QWheelEvent, QPaintEvent, QResizeEvent,
+    QRadialGradient, QPen
 )
 
 from src.hdri_engine import HDRIProject, BrushEngine, LayerType
@@ -19,7 +20,7 @@ class CanvasWidget(QWidget):
     """
     HDRI painting canvas widget.
     Displays the composited layers in equirectangular projection
-    and handles brush/eraser/fill/sun/cloud/stamp operations.
+    and handles brush/eraser/fill/sun/cloud/stamp operations with living corona and glowing viewport.
     """
 
     canvas_modified = Signal()
@@ -71,6 +72,7 @@ class CanvasWidget(QWidget):
         self._exposure = 0.0
         self._show_grid = False
         self._display_buffer = None
+        self._cached_pixmap = None
         self._display_dirty = True
 
         # Performance: throttle composite updates
@@ -78,12 +80,23 @@ class CanvasWidget(QWidget):
         self._update_timer.setSingleShot(True)
         self._update_timer.timeout.connect(self._deferred_update)
 
+        # Animated corona pulse timer for sun visualization
+        self._corona_tick = 0
+        self._corona_timer = QTimer(self)
+        self._corona_timer.timeout.connect(self._on_corona_tick)
+        self._corona_timer.start(80)
+
         self.setMinimumSize(400, 200)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.StrongFocus)
 
         # Checkerboard pattern for alpha visualization
         self._checker_pixmap = self._create_checker_pattern()
+
+    def _on_corona_tick(self):
+        self._corona_tick = (self._corona_tick + 1) % 60
+        if self.isVisible() and (self.tool == self.TOOL_SUN or (self.project.primary_sun and self._show_grid)):
+            self.update()
 
     def _create_checker_pattern(self, tile_size=16) -> QPixmap:
         """Create a checkerboard pattern for transparent areas."""
@@ -161,7 +174,7 @@ class CanvasWidget(QWidget):
     # ================================================================
 
     def _update_display_buffer(self):
-        """Update the tone-mapped display buffer from the composited HDR data."""
+        """Update the tone-mapped display buffer and cache QPixmap from the composited HDR data."""
         composite = self.project.get_composite()
 
         # Simple tone mapping for display
@@ -170,25 +183,24 @@ class CanvasWidget(QWidget):
 
         # ACES tone map
         a, b, c, d, e = 2.51, 0.03, 2.43, 0.59, 0.14
-        mapped = np.clip((rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e), 0, 1)
+        mapped = np.clip((rgb * (a * rgb + b)) / (rgb * (c * rgb + d) + e), 0.0, 1.0)
 
         # Gamma correction
         mapped = np.power(mapped, 1.0 / 2.2)
 
         # Alpha channel
-        alpha = np.clip(composite[:, :, 3], 0, 1)
+        alpha = np.clip(composite[:, :, 3], 0.0, 1.0)
 
-        # Compose with checkerboard for transparency visualization
-        rgba = np.zeros((*mapped.shape[:2], 4), dtype=np.uint8)
-        rgba[:, :, 0] = (mapped[:, :, 0] * alpha * 255).astype(np.uint8)
-        rgba[:, :, 1] = (mapped[:, :, 1] * alpha * 255).astype(np.uint8)
-        rgba[:, :, 2] = (mapped[:, :, 2] * alpha * 255).astype(np.uint8)
-        rgba[:, :, 3] = (alpha * 255).astype(np.uint8)
+        # Fast SIMD RGBA conversion
+        h, w = mapped.shape[:2]
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = (mapped * (alpha[..., np.newaxis] * 255.0)).astype(np.uint8)
+        rgba[..., 3] = (alpha * 255.0).astype(np.uint8)
 
-        h, w = rgba.shape[:2]
         self._display_buffer = QImage(
-            rgba.tobytes(), w, h, w * 4, QImage.Format_RGBA8888
+            rgba.data, w, h, w * 4, QImage.Format_RGBA8888
         ).copy()
+        self._cached_pixmap = QPixmap.fromImage(self._display_buffer)
         self._display_dirty = False
 
     # ================================================================
@@ -202,10 +214,10 @@ class CanvasWidget(QWidget):
         # Dark background
         painter.fillRect(self.rect(), QColor(30, 30, 35))
 
-        if self._display_dirty or self._display_buffer is None:
+        if self._display_dirty or self._cached_pixmap is None:
             self._update_display_buffer()
 
-        if self._display_buffer is not None:
+        if self._cached_pixmap is not None:
             # Calculate display rect
             canvas_w = int(self.project.width * self._zoom)
             canvas_h = int(self.project.height * self._zoom)
@@ -218,16 +230,15 @@ class CanvasWidget(QWidget):
             painter.setPen(Qt.NoPen)
             painter.drawRect(dest_rect)
 
-            # Draw the HDRI image
-            pixmap = QPixmap.fromImage(self._display_buffer)
-            painter.drawPixmap(dest_rect, pixmap)
+            # Draw the cached HDRI image directly (instant GPU texture blit, 0 CPU alloc)
+            painter.drawPixmap(dest_rect, self._cached_pixmap)
 
             # Draw grid overlay
             if self._show_grid:
                 self._draw_grid(painter, dest_rect)
 
-            # Draw canvas border
-            painter.setPen(QColor(100, 100, 100))
+            # Draw luminous canvas frame with subtle glow
+            painter.setPen(QPen(QColor(0, 242, 254, 150), 1.5))
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(dest_rect)
 
@@ -257,8 +268,8 @@ class CanvasWidget(QWidget):
             y = rect.y() + int(rect.height() * i / 4)
             painter.drawLine(rect.x(), y, rect.x() + rect.width(), y)
 
-        # Horizon line (stronger)
-        painter.setPen(QColor(255, 200, 50, 80))
+        # Horizon line (stronger glowing gold)
+        painter.setPen(QColor(255, 200, 50, 110))
         mid_y = rect.y() + rect.height() // 2
         painter.drawLine(rect.x(), mid_y, rect.x() + rect.width(), mid_y)
 
@@ -275,7 +286,7 @@ class CanvasWidget(QWidget):
         elif self.tool == self.TOOL_CLOUD:
             painter.setPen(QColor(180, 220, 255, 200))
         else:
-            painter.setPen(QColor(255, 255, 255, 180))
+            painter.setPen(QColor(0, 242, 254, 200))
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(pos, radius, radius)
 
@@ -287,8 +298,8 @@ class CanvasWidget(QWidget):
 
         size = max(16, int(64 * self.stamp_scale * self._zoom))
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(QColor(100, 200, 255, 200))
-        painter.setBrush(QColor(100, 200, 255, 30))
+        painter.setPen(QColor(0, 242, 254, 220))
+        painter.setBrush(QColor(0, 242, 254, 35))
 
         painter.save()
         painter.translate(pos.x(), pos.y())
@@ -299,7 +310,7 @@ class CanvasWidget(QWidget):
         painter.restore()
 
     def _draw_sun_marker(self, painter: QPainter):
-        """Draw the sun position marker with rays and crosshairs."""
+        """Draw the sun position marker with animated radiant corona and rays."""
         sun = self.project.primary_sun
         if not sun:
             return
@@ -311,24 +322,45 @@ class CanvasWidget(QWidget):
             return
 
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(QColor(255, 215, 0, 240))
-        painter.setBrush(QColor(255, 240, 150, 90))
-        painter.drawEllipse(wpos, 14, 14)
 
-        # Draw rays
-        painter.setPen(QColor(255, 220, 80, 200))
-        for r_angle in [0, 45, 90, 135, 180, 225, 270, 315]:
-            rad = math.radians(r_angle)
-            x1 = wpos.x() + int(18 * math.cos(rad))
-            y1 = wpos.y() + int(18 * math.sin(rad))
-            x2 = wpos.x() + int(26 * math.cos(rad))
-            y2 = wpos.y() + int(26 * math.sin(rad))
+        pulse = 0.88 + 0.22 * math.sin(self._corona_tick * math.pi / 30)
+        corona_r = int(24 * pulse)
+
+        # Ambient radiant gold/cyan corona
+        grad = QRadialGradient(wpos.x(), wpos.y(), corona_r * 2)
+        grad.setColorAt(0.0, QColor(255, 255, 255, 230))
+        grad.setColorAt(0.3, QColor(255, 215, 0, 160))
+        grad.setColorAt(0.7, QColor(255, 120, 0, 70))
+        grad.setColorAt(1.0, QColor(0, 242, 254, 0))
+        painter.setBrush(grad)
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(wpos, corona_r * 2, corona_r * 2)
+
+        # Sun disc
+        painter.setPen(QColor(255, 255, 255, 220))
+        painter.setBrush(QColor(255, 240, 150, 200))
+        painter.drawEllipse(wpos, 12, 12)
+
+        # Animated spinning & pulsing rays
+        base_angle = self._corona_tick * 1.5
+        for i in range(12):
+            deg = base_angle + i * 30
+            rad = math.radians(deg)
+            is_long = (i % 2 == 0)
+            ray_len = (32 if is_long else 22) * pulse
+            x1 = wpos.x() + int(14 * math.cos(rad))
+            y1 = wpos.y() + int(14 * math.sin(rad))
+            x2 = wpos.x() + int(ray_len * math.cos(rad))
+            y2 = wpos.y() + int(ray_len * math.sin(rad))
+
+            col = QColor(255, 225, 100, 200 if is_long else 130)
+            painter.setPen(QPen(col, 1.5 if is_long else 1.0))
             painter.drawLine(x1, y1, x2, y2)
 
-        # Crosshairs
-        painter.setPen(QColor(255, 255, 255, 120))
-        painter.drawLine(wpos.x() - 32, wpos.y(), wpos.x() + 32, wpos.y())
-        painter.drawLine(wpos.x(), wpos.y() - 32, wpos.x(), wpos.y() + 32)
+        # Crosshairs with glowing ends
+        painter.setPen(QPen(QColor(0, 242, 254, 180), 1, Qt.DashLine))
+        painter.drawLine(wpos.x() - 36, wpos.y(), wpos.x() + 36, wpos.y())
+        painter.drawLine(wpos.x(), wpos.y() - 36, wpos.x(), wpos.y() + 36)
 
     # ================================================================
     #  MOUSE EVENTS
@@ -384,9 +416,12 @@ class CanvasWidget(QWidget):
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
         elif event.button() == Qt.LeftButton:
+            was_active = self._painting or self._dragging_sun
             self._painting = False
             self._dragging_sun = False
             self._last_paint_pos = None
+            if was_active:
+                self.canvas_modified.emit()
 
     def wheelEvent(self, event: QWheelEvent):
         delta = event.angleDelta().y()
@@ -433,7 +468,8 @@ class CanvasWidget(QWidget):
         self.project.invalidate_cache()
         self._display_dirty = True
         self.update()
-        self.canvas_modified.emit()
+        if not self._dragging_sun:
+            self.canvas_modified.emit()
         self.sun_moved.emit(az, el)
 
     def _place_stamp(self, widget_pos: QPoint):
@@ -517,9 +553,10 @@ class CanvasWidget(QWidget):
             self._update_timer.start(16)  # ~60fps
 
     def _deferred_update(self):
-        """Deferred update for performance."""
+        """Deferred update for performance - keeps viewport at silky 60fps during active stroke."""
         self.update()
-        self.canvas_modified.emit()
+        if not self._painting and not self._dragging_sun:
+            self.canvas_modified.emit()
 
     def _eyedrop(self, widget_pos: QPoint):
         """Pick color from the composite at the given position."""

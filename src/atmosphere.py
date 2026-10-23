@@ -392,8 +392,9 @@ def render_god_rays(data: np.ndarray, sun_x: float, sun_y: float,
 
     for i in range(num_rays):
         t = (i + 1) / num_rays * ray_length
-        sample_x = (uu + dx * t / max(dist, 0.001) * t)
-        sample_y = (vv + dy * t / max(dist, 0.001) * t)
+        safe_dist = np.maximum(dist, 0.001)
+        sample_x = (uu + dx * t / safe_dist * t)
+        sample_y = (vv + dy * t / safe_dist * t)
 
         # Clamp and sample
         sx = np.clip((sample_x * w).astype(int), 0, w - 1)

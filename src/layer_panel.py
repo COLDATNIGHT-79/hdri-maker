@@ -103,9 +103,26 @@ class LayerItemWidget(QWidget):
 
     def set_active(self, active: bool):
         if active:
-            self.setStyleSheet("background: rgba(70, 130, 220, 0.35); border-radius: 4px;")
+            self.setStyleSheet("""
+                QWidget {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                        stop:0 rgba(0, 242, 254, 0.22), stop:1 rgba(123, 47, 247, 0.16));
+                    border: 1px solid rgba(0, 242, 254, 0.65);
+                    border-radius: 6px;
+                }
+            """)
         else:
-            self.setStyleSheet("")
+            self.setStyleSheet("""
+                QWidget {
+                    background: transparent;
+                    border: 1px solid transparent;
+                    border-radius: 6px;
+                }
+                QWidget:hover {
+                    background: rgba(255, 255, 255, 0.04);
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                }
+            """)
 
 
 class LayerPanel(QDockWidget):
@@ -240,14 +257,20 @@ class LayerPanel(QDockWidget):
     def _make_button(self, text: str, tooltip: str) -> QPushButton:
         btn = QPushButton(text)
         btn.setToolTip(tooltip)
-        btn.setFixedSize(30, 30)
+        btn.setFixedSize(32, 32)
         btn.setStyleSheet("""
             QPushButton {
-                background: #333; border: 1px solid #555;
-                border-radius: 4px; font-size: 13px; color: #ddd;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2a2b38, stop:1 #1e1f29);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 6px; font-size: 13px; color: #ddd;
             }
-            QPushButton:hover { background: #444; border-color: #777; }
-            QPushButton:pressed { background: #4682B4; }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #393b4d, stop:1 #272838);
+                border: 1px solid #00f2fe; color: #fff;
+            }
+            QPushButton:pressed {
+                background: #0052d4; border-color: #00f2fe;
+            }
         """)
         return btn
 

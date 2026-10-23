@@ -15,6 +15,10 @@ import numpy as np
 from enum import IntEnum
 from typing import List, Optional, Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+_NUM_CORES = max(2, min(os.cpu_count() or 4, 16))
+_HDRI_EXECUTOR = ThreadPoolExecutor(max_workers=_NUM_CORES)
 
 # ============================================================
 #  BLEND MODES
@@ -427,17 +431,15 @@ def _py_bloom_filter(data: np.ndarray, threshold: float, intensity: float, radiu
     data[:, :, :3] += bright[:, :, :3] * intensity
 
 
-def _py_composite(base: np.ndarray, overlay: np.ndarray,
-                   opacity: float, blend_mode: int) -> np.ndarray:
-    """Pure-Python layer compositing."""
-    result = base.copy()
-    b = base[..., :3]
-    o = overlay[..., :3]
+def _composite_slice(base_slice: np.ndarray, overlay_slice: np.ndarray,
+                     opacity: float, blend_mode: int) -> np.ndarray:
+    b = base_slice[..., :3]
+    o = overlay_slice[..., :3]
 
-    if overlay.shape[2] == 4:
-        oa = overlay[..., 3:4] * opacity
+    if overlay_slice.shape[2] == 4:
+        oa = overlay_slice[..., 3:4] * opacity
     else:
-        oa = np.full((*base.shape[:2], 1), opacity, dtype=np.float32)
+        oa = np.full((*base_slice.shape[:2], 1), opacity, dtype=np.float32)
 
     if blend_mode == BlendMode.NORMAL:
         blended = o
@@ -449,16 +451,44 @@ def _py_composite(base: np.ndarray, overlay: np.ndarray,
         blended = 1.0 - (1.0 - b) * (1.0 - o)
     elif blend_mode == BlendMode.OVERLAY:
         blended = np.where(b < 0.5, 2.0 * b * o, 1.0 - 2.0 * (1.0 - b) * (1.0 - o))
+    elif blend_mode == BlendMode.SOFT_LIGHT:
+        blended = (1.0 - 2.0 * o) * (b ** 2) + 2.0 * b * o
     else:
         blended = o
 
-    result[..., :3] = b * (1.0 - oa) + blended * oa
+    res = np.empty_like(base_slice)
+    res[..., :3] = b * (1.0 - oa) + blended * oa
 
-    if base.shape[2] == 4:
-        ba = base[..., 3:4]
-        result[..., 3:4] = ba + oa * (1.0 - ba)
+    if base_slice.shape[2] == 4:
+        ba = base_slice[..., 3:4]
+        res[..., 3:4] = ba + oa * (1.0 - ba)
 
-    return result
+    return res
+
+
+def _py_composite(base: np.ndarray, overlay: np.ndarray,
+                   opacity: float, blend_mode: int) -> np.ndarray:
+    """Vectorized SIMD layer compositing without thread scheduling overhead."""
+    return _composite_slice(base, overlay, opacity, blend_mode)
+
+
+_EQUIRECT_GRID_CACHE = {}
+
+
+def get_equirect_grid(w: int, h: int):
+    """Cached spherical equirectangular unit vector directions and UV mesh."""
+    key = (w, h)
+    if key not in _EQUIRECT_GRID_CACHE:
+        us = np.linspace(0, 1, w, dtype=np.float32)
+        vs = np.linspace(0, 1, h, dtype=np.float32)
+        uu, vv = np.meshgrid(us, vs)
+        theta = uu * (2.0 * np.pi)
+        phi = vv * np.pi
+        dx = np.sin(phi) * np.cos(theta)
+        dy = np.cos(phi)
+        dz = np.sin(phi) * np.sin(theta)
+        _EQUIRECT_GRID_CACHE[key] = (uu, vv, dx, dy, dz)
+    return _EQUIRECT_GRID_CACHE[key]
 
 
 def _py_color_grade(data: np.ndarray, lift, gamma, gain):
@@ -477,17 +507,7 @@ def _py_generate_sky(data: np.ndarray, horizon, zenith, ground,
                       sun_intensity, sun_x, sun_y, sun_size):
     """Pure-Python procedural sky generation."""
     h, w, c = data.shape
-    vs = np.linspace(0, 1, h)
-    us = np.linspace(0, 1, w)
-    uu, vv = np.meshgrid(us, vs)
-
-    theta = uu * 2.0 * np.pi
-    phi = vv * np.pi
-
-    # Direction vectors
-    dx = np.sin(phi) * np.cos(theta)
-    dy = np.cos(phi)
-    dz = np.sin(phi) * np.sin(theta)
+    uu, vv, dx, dy, dz = get_equirect_grid(w, h)
 
     # Sun direction
     sun_theta = sun_x * 2.0 * np.pi
@@ -539,18 +559,10 @@ def render_sun(data: np.ndarray, sun: SunObject):
     """
     Render a sun object into an RGBA float32 array (in-place).
     Includes disc, limb darkening, halo, and optional flare.
+    Uses cached equirectangular spherical directions for instant execution.
     """
     h, w, c = data.shape
-    us = np.linspace(0, 1, w, dtype=np.float32)
-    vs = np.linspace(0, 1, h, dtype=np.float32)
-    uu, vv = np.meshgrid(us, vs)
-
-    theta = uu * 2.0 * np.pi
-    phi = vv * np.pi
-
-    dx = np.sin(phi) * np.cos(theta)
-    dy = np.cos(phi)
-    dz = np.sin(phi) * np.sin(theta)
+    uu, vv, dx, dy, dz = get_equirect_grid(w, h)
 
     sun_theta = sun.azimuth * 2.0 * np.pi
     sun_phi = sun.elevation * np.pi
@@ -668,9 +680,14 @@ class HDRILayer:
         # Per-layer effects
         self.effects: List[dict] = []
 
+        # Fast thumbnail cache
+        self._cached_thumb: Optional[np.ndarray] = None
+        self._thumb_dirty: bool = True
+
     def clear(self, color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)):
         """Clear the layer to a solid color."""
         self.data[:] = color
+        self._thumb_dirty = True
 
     def regenerate(self, project=None):
         """
@@ -767,18 +784,26 @@ class HDRILayer:
         return new_layer
 
     def get_thumbnail(self, size: int = 48) -> np.ndarray:
-        """Generate a small thumbnail of this layer (LDR, uint8, RGBA)."""
+        """Generate a small thumbnail of this layer (ultra-fast strided subsampling + cache)."""
+        if not self._thumb_dirty and self._cached_thumb is not None:
+            return self._cached_thumb
+
         from PIL import Image
 
-        # Tone map for display
-        display = np.clip(self.data[..., :3], 0, 1)
-        alpha = np.clip(self.data[..., 3:4], 0, 1)
-        display = np.concatenate([display, alpha], axis=2)
-        display = (display * 255).astype(np.uint8)
+        # Fast strided subsampling directly in NumPy (avoids processing millions of pixels!)
+        step_y = max(1, self.height // (size * 2))
+        step_x = max(1, self.width // (size * 2))
+        sub = self.data[::step_y, ::step_x]
 
-        img = Image.fromarray(display, 'RGBA')
-        img = img.resize((size, size), Image.Resampling.LANCZOS)
-        return np.array(img)
+        rgb = np.clip(sub[..., :3], 0.0, 1.0)
+        alpha = np.clip(sub[..., 3:4], 0.0, 1.0)
+        rgba = (np.dstack([rgb, alpha]) * 255).astype(np.uint8)
+
+        img = Image.fromarray(rgba, 'RGBA')
+        img = img.resize((size, size), Image.Resampling.BILINEAR)
+        self._cached_thumb = np.array(img)
+        self._thumb_dirty = False
+        return self._cached_thumb
 
 
 # ============================================================
@@ -1243,7 +1268,7 @@ class BrushEngine:
         self._stamp_cache = {}
 
     def get_stamp(self, size: int = None, hardness: float = None) -> np.ndarray:
-        """Generate a circular brush stamp (alpha mask)."""
+        """Generate a circular brush stamp with SIMD array math."""
         size = size or self.size
         hardness = hardness or self.hardness
         key = (size, int(hardness * 100))
@@ -1252,98 +1277,101 @@ class BrushEngine:
             return self._stamp_cache[key]
 
         diameter = size * 2 + 1
-        stamp = np.zeros((diameter, diameter), dtype=np.float32)
-        center = size
+        y, x = np.ogrid[-size:size + 1, -size:size + 1]
+        dist = np.sqrt(x * x + y * y) / float(max(size, 1))
 
-        for y in range(diameter):
-            for x in range(diameter):
-                dist = np.sqrt((x - center) ** 2 + (y - center) ** 2) / size
-                if dist <= 1.0:
-                    # Hardness controls falloff
-                    if hardness >= 1.0:
-                        stamp[y, x] = 1.0
-                    else:
-                        edge_start = hardness
-                        if dist <= edge_start:
-                            stamp[y, x] = 1.0
-                        else:
-                            t = (dist - edge_start) / (1.0 - edge_start)
-                            stamp[y, x] = 1.0 - t * t  # Quadratic falloff
+        stamp = np.zeros((diameter, diameter), dtype=np.float32)
+        if hardness >= 1.0:
+            stamp[dist <= 1.0] = 1.0
+        else:
+            stamp[dist <= hardness] = 1.0
+            falloff_mask = (dist > hardness) & (dist <= 1.0)
+            t = (dist[falloff_mask] - hardness) / max(1e-5, (1.0 - hardness))
+            stamp[falloff_mask] = 1.0 - t * t
 
         self._stamp_cache[key] = stamp
         return stamp
 
+    def _apply_slice_blend(self, target_data: np.ndarray, stamp_slice: np.ndarray,
+                           color_rgb: np.ndarray, opacity: float, erase: bool):
+        """Vectorized alpha-blending for an image slice."""
+        alpha = stamp_slice[..., np.newaxis] * opacity
+        if erase:
+            target_data[..., 3:4] *= (1.0 - alpha)
+        else:
+            old_a = target_data[..., 3:4]
+            new_a = np.clip(old_a + alpha * (1.0 - old_a), 0.0, 1.0)
+            blend = np.where(new_a > 1e-6, alpha / np.maximum(new_a, 1e-6), 0.0)
+            target_data[..., :3] = target_data[..., :3] * (1.0 - blend) + color_rgb * blend
+            target_data[..., 3:4] = new_a
+
+    def _apply_slice_mask(self, target_mask: np.ndarray, stamp_slice: np.ndarray,
+                          opacity: float, erase: bool, mask_value: float):
+        """Vectorized mask brush application."""
+        alpha = stamp_slice * opacity
+        if erase:
+            target_mask[:] = np.maximum(0.0, target_mask - alpha)
+        else:
+            target_mask[:] = np.minimum(1.0, target_mask + alpha * mask_value)
+
     def paint_stroke(self, layer: HDRILayer, x: int, y: int, erase: bool = False,
                      paint_mask: bool = False, mask_value: float = 1.0):
-        """Paint a single brush stamp at position (x, y) on the layer."""
+        """Paint a single brush stamp at position (x, y) with pure SIMD array slicing."""
         if layer.locked:
             return
 
         stamp = self.get_stamp()
         radius = self.size
         diameter = radius * 2 + 1
-
         h, w = layer.height, layer.width
 
-        # If painting on mask
-        if paint_mask and layer.mask is not None:
-            for sy in range(diameter):
-                for sx in range(diameter):
-                    if stamp[sy, sx] <= 0:
-                        continue
-                    px = (x - radius + sx) % w
-                    py = y - radius + sy
-                    if py < 0 or py >= h:
-                        continue
-                    alpha = stamp[sy, sx] * self.opacity
-                    if erase:
-                        layer.mask[py, px] = max(0, layer.mask[py, px] - alpha)
-                    else:
-                        layer.mask[py, px] = min(1, layer.mask[py, px] + alpha * mask_value)
+        # Vertical range
+        y0 = y - radius
+        y1 = y + radius + 1
+        py0 = max(0, y0)
+        py1 = min(h, y1)
+        if py0 >= py1:
             return
+        sy0 = py0 - y0
+        sy1 = sy0 + (py1 - py0)
 
-        # Regular painting
-        for sy in range(diameter):
-            for sx in range(diameter):
-                if stamp[sy, sx] <= 0:
-                    continue
+        color_rgb = np.array(self.color[:3], dtype=np.float32) * self.intensity
 
-                px = (x - radius + sx) % w  # Wrap horizontally
-                py = y - radius + sy
+        # Horizontal wrapping handling
+        x0 = x - radius
+        x1 = x + radius + 1
 
-                if py < 0 or py >= h:
-                    continue
+        segments = []
+        if x0 < 0:
+            segments.append((w + x0, w, 0, -x0))
+            segments.append((0, min(w, x1), -x0, diameter))
+        elif x1 > w:
+            segments.append((x0, w, 0, w - x0))
+            segments.append((0, x1 - w, w - x0, diameter))
+        else:
+            segments.append((x0, x1, 0, diameter))
 
-                alpha = stamp[sy, sx] * self.opacity
+        for tx0, tx1, sx0, sx1 in segments:
+            if tx0 >= tx1 or sx0 >= sx1:
+                continue
+            stamp_sub = stamp[sy0:sy1, sx0:sx1]
+            if paint_mask and layer.mask is not None:
+                self._apply_slice_mask(layer.mask[py0:py1, tx0:tx1], stamp_sub,
+                                       self.opacity, erase, mask_value)
+            else:
+                self._apply_slice_blend(layer.data[py0:py1, tx0:tx1], stamp_sub,
+                                        color_rgb, self.opacity, erase)
 
-                if erase:
-                    # Eraser: reduce alpha
-                    layer.data[py, px, 3] *= (1.0 - alpha)
-                else:
-                    # Paint: blend color with HDR intensity
-                    r = self.color[0] * self.intensity
-                    g = self.color[1] * self.intensity
-                    b = self.color[2] * self.intensity
-
-                    old_a = layer.data[py, px, 3]
-                    new_a = old_a + alpha * (1.0 - old_a)
-
-                    if new_a > 0:
-                        blend = alpha / new_a
-                        layer.data[py, px, 0] = layer.data[py, px, 0] * (1.0 - blend) + r * blend
-                        layer.data[py, px, 1] = layer.data[py, px, 1] * (1.0 - blend) + g * blend
-                        layer.data[py, px, 2] = layer.data[py, px, 2] * (1.0 - blend) + b * blend
-                        layer.data[py, px, 3] = new_a
+        layer._thumb_dirty = True
 
     def paint_line(self, layer: HDRILayer, x0: int, y0: int, x1: int, y1: int,
                    erase: bool = False, paint_mask: bool = False, mask_value: float = 1.0):
-        """Paint along a line from (x0,y0) to (x1,y1) using Bresenham-like stepping."""
+        """Paint along a line from (x0,y0) to (x1,y1) using stepped interpolation."""
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         dist = max(dx, dy, 1)
 
-        # Step size based on brush size for smooth strokes
-        step = max(1, self.size // 3)
+        step = max(2, self.size // 3)
         num_steps = max(dist // step, 1)
 
         for i in range(num_steps + 1):
@@ -1355,7 +1383,7 @@ class BrushEngine:
     def paint_cloud_stroke(self, layer: HDRILayer, x: int, y: int,
                            cloud_settings=None, sun_az: float = 0.25, sun_el: float = 0.25,
                            sun_color=(1.0, 0.95, 0.85)):
-        """Paint a procedural cloud brush dab onto the layer."""
+        """Paint a procedural cloud brush dab onto the layer with SIMD vectorization."""
         if layer.locked:
             return
         from src.cloud_engine import render_cloud_brush_stamp, CloudSettings
@@ -1367,26 +1395,43 @@ class BrushEngine:
         stamp = render_cloud_brush_stamp(diameter, cloud_settings, sun_az, sun_el, sun_color)
 
         h, w = layer.height, layer.width
-        for sy in range(diameter):
-            for sx in range(diameter):
-                alpha = stamp[sy, sx, 3] * self.opacity
-                if alpha <= 0.005:
-                    continue
-                px = (x - radius + sx) % w
-                py = y - radius + sy
-                if py < 0 or py >= h:
-                    continue
+        y0 = y - radius
+        y1 = y + radius
+        py0 = max(0, y0)
+        py1 = min(h, y1)
+        if py0 >= py1:
+            return
+        sy0 = py0 - y0
+        sy1 = sy0 + (py1 - py0)
 
-                rgb = stamp[sy, sx, :3] * self.intensity
-                old_a = layer.data[py, px, 3]
-                new_a = min(1.0, old_a + alpha * (1.0 - old_a))
+        x0 = x - radius
+        x1 = x + radius
 
-                if new_a > 0:
-                    blend = alpha / new_a
-                    layer.data[py, px, 0] = layer.data[py, px, 0] * (1.0 - blend) + rgb[0] * blend
-                    layer.data[py, px, 1] = layer.data[py, px, 1] * (1.0 - blend) + rgb[1] * blend
-                    layer.data[py, px, 2] = layer.data[py, px, 2] * (1.0 - blend) + rgb[2] * blend
-                    layer.data[py, px, 3] = new_a
+        segments = []
+        if x0 < 0:
+            segments.append((w + x0, w, 0, -x0))
+            segments.append((0, min(w, x1), -x0, diameter))
+        elif x1 > w:
+            segments.append((x0, w, 0, w - x0))
+            segments.append((0, x1 - w, w - x0, diameter))
+        else:
+            segments.append((x0, x1, 0, diameter))
+
+        for tx0, tx1, sx0, sx1 in segments:
+            if tx0 >= tx1 or sx0 >= sx1:
+                continue
+            stamp_sub = stamp[sy0:sy1, sx0:sx1]
+            alpha = stamp_sub[..., 3:4] * self.opacity
+            rgb = stamp_sub[..., :3] * self.intensity
+
+            target = layer.data[py0:py1, tx0:tx1]
+            old_a = target[..., 3:4]
+            new_a = np.clip(old_a + alpha * (1.0 - old_a), 0.0, 1.0)
+            blend = np.where(new_a > 1e-6, alpha / np.maximum(new_a, 1e-6), 0.0)
+            target[..., :3] = target[..., :3] * (1.0 - blend) + rgb * blend
+            target[..., 3:4] = new_a
+
+        layer._thumb_dirty = True
 
     def paint_cloud_line(self, layer: HDRILayer, x0: int, y0: int, x1: int, y1: int,
                          cloud_settings=None, sun_az: float = 0.25, sun_el: float = 0.25,
@@ -1395,7 +1440,7 @@ class BrushEngine:
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         dist = max(dx, dy, 1)
-        step = max(4, self.size // 2)
+        step = max(6, self.size // 2)
         num_steps = max(dist // step, 1)
         for i in range(num_steps + 1):
             t = i / num_steps if num_steps > 0 else 0

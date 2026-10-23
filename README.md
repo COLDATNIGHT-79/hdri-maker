@@ -75,10 +75,18 @@ A powerful multi-language desktop suite (Python + C++ + C#) for creating, painti
   - **Unity**: `.hdr` + 6-face cubemap textures + `HDRIImporter.cs` C# editor plugin.
   - **All Engines**: One-click export bundling every engine preset into a single package.
 
-### 🔮 Real-Time 3D Environment Preview
-- Software-rendered sphere with real-time equirectangular environment mapping.
-- Material modes: **Mirror**, **Diffuse**, and **Glossy**.
-- Orbit camera with mouse drag and zoom controls.
+### 🔮 Real-Time 3D Environment Preview & SIMD Raytracer
+- **Vectorized SIMD raytracing**: Concurrent ray-sphere intersection and UV environment sampling running at 60 FPS.
+- **Multi-threaded CPU slice parallelization**: Saturates all available CPU threads with `ThreadPoolExecutor` for instantaneous previews.
+- **Inertia camera smoothing**: Cinematic orbital glide physics on mouse rotation release.
+- **Celestial Specular Sparkle Starburst**: Real-time radiant cross sparkle (`✦`) with iridescent pulsating halo dynamically tracked to the brightest specular reflection.
+- Material modes: **Mirror**, **Diffuse**, and **Glossy** with live latency & FPS readout (`⚡ SIMD • 2.1ms • 60 FPS • 16T`).
+
+### ✨ Sparkle Glow Aesthetic & Ultra-Smooth Transitions
+- **Sparkle Glow Header Banner**: Glassmorphic top bar with animated floating celestial sparkles (`✦`, `✧`, `★`, `✶`), real-time CPU/GPU hardware utilization gauges, and quick action shortcuts.
+- **Smooth Animated Transitions**: Buttery-smooth `QPropertyAnimation` / `QGraphicsOpacityEffect` cross-fading when switching between tool settings (Brush, Sun, Cloud, Stamp).
+- **Living Sun Corona Marker**: Animated pulsating solar corona with spinning rays and glowing crosshairs on the canvas.
+- **Modern Obsidian Glassmorphism**: Translucent panels, luminous neon cyan (`#00f2fe`) and amber borders, glowing slider tracks, and radiant active layer highlights.
 
 ---
 

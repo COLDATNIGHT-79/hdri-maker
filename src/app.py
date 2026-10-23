@@ -6,16 +6,22 @@ project save/load, layer creation, cross-engine export, and procedural generator
 
 import os
 import sys
+import math
+import random
 import numpy as np
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QApplication, QFileDialog, QMessageBox, QSplitter,
     QStatusBar, QMenuBar, QToolBar, QLabel, QDockWidget, QWidget,
-    QVBoxLayout, QHBoxLayout, QProgressDialog, QInputDialog
+    QVBoxLayout, QHBoxLayout, QProgressDialog, QInputDialog,
+    QPushButton, QFrame
 )
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QAction, QKeySequence, QIcon, QColor
+from PySide6.QtCore import Qt, QSize, QTimer, QPointF
+from PySide6.QtGui import (
+    QAction, QKeySequence, QIcon, QColor, QPainter,
+    QLinearGradient, QRadialGradient, QPen, QFont
+)
 
 from src.hdri_engine import (
     HDRIProject, BrushEngine, LayerType, SunObject,
@@ -37,6 +43,226 @@ from src.exporter import (
     export_blender_script, export_unreal, export_godot,
     export_project, export_with_preset, EXPORT_PRESETS
 )
+
+
+class SparkleParticle:
+    """Individual twinkling celestial star particle with phase and color."""
+
+    def __init__(self, w, h):
+        self.x = random.uniform(0, max(w, 800))
+        self.y = random.uniform(2, max(h - 4, 30))
+        self.vx = random.uniform(0.15, 0.45)
+        self.vy = random.uniform(-0.08, 0.08)
+        self.size = random.uniform(5.0, 9.0)
+        self.phase = random.uniform(0, math.pi * 2)
+        self.speed = random.uniform(0.04, 0.08)
+        self.char = random.choice(["✦", "✧", "★", "✶", "✨"])
+        self.color_type = random.choice(["cyan", "gold", "violet", "white"])
+
+    def update(self, w, h):
+        self.x += self.vx
+        self.y += self.vy
+        self.phase += self.speed
+        if self.x > w + 20:
+            self.x = -20
+            self.y = random.uniform(4, max(h - 4, 30))
+        if self.y < 2:
+            self.y = h - 4
+        elif self.y > h - 2:
+            self.y = 4
+
+
+class SparkleGlowBanner(QWidget):
+    """
+    Stunning glassmorphic top banner with animated floating celestial sparkles,
+    real-time multi-core CPU/GPU hardware metrics, and quick action shortcuts.
+    """
+
+    def __init__(self, app_window, parent=None):
+        super().__init__(parent)
+        self.app_window = app_window
+        self.setFixedHeight(48)
+        self.setMouseTracking(True)
+
+        self._tick = 0
+        self._particles = [SparkleParticle(1400, 48) for _ in range(14)]
+
+        # Lightweight twinkle animation timer
+        self._anim_timer = QTimer(self)
+        self._anim_timer.timeout.connect(self._on_tick)
+        self._anim_timer.start(80)
+
+        # Controls layout
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 2, 14, 2)
+        layout.setSpacing(10)
+
+        # Brand Title badge
+        title_box = QHBoxLayout()
+        title_box.setSpacing(8)
+
+        self.brand_title = QLabel("✨ HDRI MAKER PRO")
+        self.brand_title.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                font-size: 13px;
+                font-weight: 900;
+                letter-spacing: 1.5px;
+            }
+        """)
+        title_box.addWidget(self.brand_title)
+
+        tagline = QLabel("✦ Substance Painter for Lighting ✦")
+        tagline.setStyleSheet("""
+            QLabel {
+                color: #00f2fe;
+                font-size: 10px;
+                font-weight: bold;
+                background: rgba(0, 242, 254, 0.12);
+                border: 1px solid rgba(0, 242, 254, 0.4);
+                border-radius: 9px;
+                padding: 1px 7px;
+            }
+        """)
+        title_box.addWidget(tagline)
+        layout.addLayout(title_box)
+
+        layout.addStretch(1)
+
+        # Quick Actions
+        actions_box = QHBoxLayout()
+        actions_box.setSpacing(6)
+
+        btn_style = """
+            QPushButton {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(40, 42, 58, 0.85), stop:1 rgba(25, 26, 36, 0.85));
+                border: 1px solid rgba(255, 255, 255, 0.14);
+                border-radius: 5px;
+                color: #e0e6ed;
+                font-size: 11px;
+                font-weight: 600;
+                padding: 4px 9px;
+            }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 rgba(55, 58, 80, 0.95), stop:1 rgba(35, 38, 52, 0.95));
+                border: 1px solid #00f2fe;
+                color: #ffffff;
+            }
+            QPushButton:pressed {
+                background: #0052d4;
+            }
+        """
+
+        self.btn_preset = QPushButton("🚀 Presets")
+        self.btn_preset.setStyleSheet(btn_style)
+        self.btn_preset.clicked.connect(self.app_window._export_presets_dialog)
+        actions_box.addWidget(self.btn_preset)
+
+        self.btn_sun = QPushButton("☀ Sun Creator")
+        self.btn_sun.setStyleSheet(btn_style)
+        self.btn_sun.clicked.connect(lambda: self.app_window.tools_panel._select_tool(CanvasWidget.TOOL_SUN))
+        actions_box.addWidget(self.btn_sun)
+
+        self.btn_cloud = QPushButton("☁ Cloud Painter")
+        self.btn_cloud.setStyleSheet(btn_style)
+        self.btn_cloud.clicked.connect(lambda: self.app_window.tools_panel._select_tool(CanvasWidget.TOOL_CLOUD))
+        actions_box.addWidget(self.btn_cloud)
+
+        self.btn_atmo = QPushButton("🌅 Atmosphere")
+        self.btn_atmo.setStyleSheet(btn_style)
+        self.btn_atmo.clicked.connect(self.app_window._filter_atmosphere)
+        actions_box.addWidget(self.btn_atmo)
+
+        layout.addLayout(actions_box)
+
+        layout.addStretch(1)
+
+        # Hardware Performance HUD
+        hud_box = QHBoxLayout()
+        hud_box.setSpacing(6)
+
+        cores = os.cpu_count() or 8
+        self.cpu_hud = QLabel(f"⚡ CPU: {cores} Cores SIMD")
+        self.cpu_hud.setStyleSheet("""
+            QLabel {
+                color: #00f2fe;
+                font-size: 10px;
+                font-weight: bold;
+                background: rgba(0, 242, 254, 0.08);
+                border: 1px solid rgba(0, 242, 254, 0.35);
+                border-radius: 4px;
+                padding: 2px 7px;
+            }
+        """)
+        hud_box.addWidget(self.cpu_hud)
+
+        self.gpu_hud = QLabel("💎 GPU Viewport 60 FPS")
+        self.gpu_hud.setStyleSheet("""
+            QLabel {
+                color: #ffb703;
+                font-size: 10px;
+                font-weight: bold;
+                background: rgba(255, 183, 3, 0.08);
+                border: 1px solid rgba(255, 183, 3, 0.35);
+                border-radius: 4px;
+                padding: 2px 7px;
+            }
+        """)
+        hud_box.addWidget(self.gpu_hud)
+
+        layout.addLayout(hud_box)
+
+    def _on_tick(self):
+        self._tick = (self._tick + 1) % 1000
+        w = max(self.width(), 800)
+        h = max(self.height(), 40)
+        for p in self._particles:
+            p.update(w, h)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+
+        # Obsidian glassmorphic background
+        bg_grad = QLinearGradient(0, 0, w, h)
+        bg_grad.setColorAt(0.0, QColor(13, 14, 20, 250))
+        bg_grad.setColorAt(0.5, QColor(20, 22, 33, 250))
+        bg_grad.setColorAt(1.0, QColor(13, 14, 20, 250))
+        painter.fillRect(0, 0, w, h, bg_grad)
+
+        # Luminous rainbow glow bottom border
+        border_grad = QLinearGradient(0, h - 2, w, h - 2)
+        border_grad.setColorAt(0.0, QColor(0, 242, 254, 210))
+        border_grad.setColorAt(0.35, QColor(123, 47, 247, 220))
+        border_grad.setColorAt(0.70, QColor(255, 0, 128, 200))
+        border_grad.setColorAt(1.0, QColor(255, 183, 3, 220))
+
+        painter.setPen(QPen(border_grad, 2.0))
+        painter.drawLine(0, h - 1, w, h - 1)
+
+        # Floating celestial sparkle particles
+        for p in self._particles:
+            alpha = int(140 + 115 * math.sin(p.phase))
+            if p.color_type == "cyan":
+                color = QColor(0, 242, 254, alpha)
+            elif p.color_type == "gold":
+                color = QColor(255, 215, 0, alpha)
+            elif p.color_type == "violet":
+                color = QColor(180, 120, 255, alpha)
+            else:
+                color = QColor(255, 255, 255, alpha)
+
+            painter.setPen(color)
+            font = painter.font()
+            font.setPointSize(int(p.size))
+            painter.setFont(font)
+            painter.drawText(QPointF(p.x, p.y), p.char)
+
+        painter.end()
 
 
 class HDRIMakerApp(QMainWindow):
@@ -82,7 +308,16 @@ class HDRIMakerApp(QMainWindow):
     # ================================================================
 
     def _setup_ui(self):
-        """Create and arrange all central widgets and docks."""
+        """Create and arrange all central widgets, sparkling banner, and docks."""
+        central_container = QWidget()
+        central_layout = QVBoxLayout(central_container)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+
+        # Top animated sparkling glow header banner
+        self.sparkle_banner = SparkleGlowBanner(self)
+        central_layout.addWidget(self.sparkle_banner)
+
         # Canvas and 3D preview split view
         canvas_preview_splitter = QSplitter(Qt.Horizontal)
 
@@ -97,7 +332,9 @@ class HDRIMakerApp(QMainWindow):
         canvas_preview_splitter.addWidget(self.preview_3d)
 
         canvas_preview_splitter.setSizes([950, 350])
-        self.setCentralWidget(canvas_preview_splitter)
+        central_layout.addWidget(canvas_preview_splitter, 1)
+
+        self.setCentralWidget(central_container)
 
         # Tools panel (left dock)
         self.tools_panel = ToolsPanel(self.brush, self.canvas)
@@ -374,31 +611,39 @@ class HDRIMakerApp(QMainWindow):
         help_menu.addAction(about_action)
 
     def _setup_toolbar(self):
-        """Create the quick-access main toolbar."""
+        """Create the quick-access main toolbar with glowing gradient styling."""
         toolbar = QToolBar("Main Toolbar")
         toolbar.setIconSize(QSize(22, 22))
         toolbar.setMovable(False)
         toolbar.setStyleSheet("""
             QToolBar {
-                background: #252528;
-                border-bottom: 1px solid #3c3c40;
-                padding: 3px;
-                spacing: 4px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #181926, stop:1 #11121c);
+                border-bottom: 1px solid rgba(0, 242, 254, 0.22);
+                padding: 4px;
+                spacing: 5px;
             }
             QToolButton {
-                background: #333;
-                border: 1px solid #4a4a50;
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #ddd;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #272838, stop:1 #1c1d28);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                border-radius: 5px;
+                padding: 4px 9px;
+                color: #e0e6ed;
                 font-size: 11px;
+                font-weight: 500;
             }
             QToolButton:hover {
-                background: #444;
-                border-color: #6a6a75;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #393b52, stop:1 #27283a);
+                border: 1px solid #00f2fe;
+                color: #ffffff;
             }
             QToolButton:pressed {
-                background: #4682B4;
+                background: #0052d4;
+                border-color: #00f2fe;
+            }
+            QToolBar::separator {
+                width: 1px;
+                background: rgba(255, 255, 255, 0.1);
+                margin: 4px 6px;
             }
         """)
 
@@ -430,20 +675,20 @@ class HDRIMakerApp(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
 
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("color: #aaa;")
+        self.status_label = QLabel("✨ System Ready • HDR 32-bit Float Pipeline Active")
+        self.status_label.setStyleSheet("color: #00f2fe; font-weight: bold; padding-left: 6px;")
         self.status_bar.addWidget(self.status_label, 1)
 
         self.pos_label = QLabel("X: 0  Y: 0")
-        self.pos_label.setStyleSheet("color: #888;")
+        self.pos_label.setStyleSheet("color: #aaa; background: rgba(255,255,255,0.06); border-radius: 3px; padding: 2px 7px;")
         self.status_bar.addPermanentWidget(self.pos_label)
 
-        self.size_label = QLabel(f"{self.project.width} × {self.project.height}")
-        self.size_label.setStyleSheet("color: #888;")
+        self.size_label = QLabel(f"{self.project.width} × {self.project.height} [Float32]")
+        self.size_label.setStyleSheet("color: #aaa; background: rgba(255,255,255,0.06); border-radius: 3px; padding: 2px 7px;")
         self.status_bar.addPermanentWidget(self.size_label)
 
         self.layer_count_label = QLabel(f"Layers: {len(self.project.layers)}")
-        self.layer_count_label.setStyleSheet("color: #888;")
+        self.layer_count_label.setStyleSheet("color: #72efdd; background: rgba(0,242,254,0.1); border: 1px solid rgba(0,242,254,0.3); border-radius: 3px; padding: 2px 7px; font-weight: bold;")
         self.status_bar.addPermanentWidget(self.layer_count_label)
 
     def _connect_signals(self):
@@ -460,68 +705,104 @@ class HDRIMakerApp(QMainWindow):
     def _apply_stylesheet(self):
         self.setStyleSheet("""
             QMainWindow {
-                background: #1a1a1d;
+                background: #0d0e14;
             }
             QMenuBar {
-                background: #252528;
-                color: #ddd;
-                border-bottom: 1px solid #3c3c40;
-                padding: 2px;
+                background: #151622;
+                color: #e0e6ed;
+                border-bottom: 1px solid rgba(0, 242, 254, 0.2);
+                padding: 3px;
+                font-size: 12px;
+            }
+            QMenuBar::item {
+                padding: 4px 10px;
+                background: transparent;
+                border-radius: 4px;
             }
             QMenuBar::item:selected {
-                background: #4682B4;
-                border-radius: 3px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0052d4, stop:1 #4364f7);
+                color: #ffffff;
             }
             QMenu {
-                background: #2b2b2f;
-                color: #ddd;
-                border: 1px solid #4a4a50;
+                background: #171825;
+                color: #e0e6ed;
+                border: 1px solid rgba(0, 242, 254, 0.35);
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 22px 6px 14px;
+                border-radius: 4px;
             }
             QMenu::item:selected {
-                background: #4682B4;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #0052d4, stop:1 #00f2fe);
+                color: #ffffff;
             }
             QMenu::separator {
                 height: 1px;
-                background: #444;
+                background: rgba(255, 255, 255, 0.12);
                 margin: 4px 8px;
             }
             QDockWidget {
-                color: #ddd;
+                color: #e0e6ed;
             }
             QDockWidget::title {
-                background: #252528;
-                padding: 6px;
-                border-bottom: 1px solid #3c3c40;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1a1c29, stop:1 #13141f);
+                padding: 7px;
+                border-bottom: 1px solid rgba(0, 242, 254, 0.22);
                 font-weight: bold;
                 font-size: 11px;
+                color: #00f2fe;
             }
             QStatusBar {
-                background: #252528;
-                border-top: 1px solid #3c3c40;
+                background: #11121b;
+                border-top: 1px solid rgba(0, 242, 254, 0.22);
                 color: #aaa;
+                font-size: 11px;
             }
             QSplitter::handle {
-                background: #333;
-                width: 2px;
+                background: #252738;
+                width: 3px;
+            }
+            QSplitter::handle:hover {
+                background: #00f2fe;
             }
             QSlider::groove:horizontal {
-                height: 4px;
-                background: #3c3c40;
-                border-radius: 2px;
+                height: 6px;
+                background: #161724;
+                border: 1px solid rgba(0, 242, 254, 0.25);
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #00f2fe, stop:1 #4facfe);
+                border-radius: 3px;
             }
             QSlider::handle:horizontal {
-                background: #4682B4;
-                border: 1px solid #5a9bd5;
-                width: 14px;
-                height: 14px;
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, stop:0 #ffffff, stop:0.7 #00f2fe, stop:1 #0099cc);
+                border: 1px solid #ffffff;
+                width: 16px;
+                height: 16px;
                 margin: -5px 0;
-                border-radius: 7px;
+                border-radius: 8px;
             }
             QSlider::handle:horizontal:hover {
-                background: #5a9bd5;
+                background: qradialgradient(cx:0.5, cy:0.5, radius:0.5, fx:0.5, fy:0.5, stop:0 #ffffff, stop:0.6 #ffdd00, stop:1 #ff9900);
+                border: 2px solid #ffffff;
+            }
+            QScrollBar:vertical {
+                background: #11121a;
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #2b2d40;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #00f2fe;
             }
             QLabel {
-                color: #ccc;
+                color: #ccd2db;
             }
         """)
 
@@ -531,7 +812,7 @@ class HDRIMakerApp(QMainWindow):
 
     def _on_canvas_modified(self):
         self.layer_panel.update_thumbnails()
-        self.preview_3d.request_render()
+        self.preview_3d.request_render(delay_ms=60)
         self._update_status()
 
     def _on_cursor_moved(self, x, y):
@@ -539,7 +820,7 @@ class HDRIMakerApp(QMainWindow):
 
     def _on_layer_changed(self):
         self.canvas.refresh()
-        self.preview_3d.request_render()
+        self.preview_3d.request_render(delay_ms=60)
         self._update_status()
 
     def _on_active_layer_changed(self, index):

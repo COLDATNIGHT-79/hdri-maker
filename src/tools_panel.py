@@ -13,10 +13,13 @@ from PySide6.QtWidgets import (
     QPushButton, QSlider, QGroupBox, QFormLayout, QColorDialog,
     QFrame, QSizePolicy, QDoubleSpinBox, QSpinBox, QToolButton,
     QStackedWidget, QComboBox, QCheckBox, QScrollArea, QFileDialog,
-    QListWidget, QListWidgetItem, QGridLayout
+    QListWidget, QListWidgetItem, QGridLayout, QGraphicsOpacityEffect
 )
-from PySide6.QtCore import Qt, Signal, QSize
-from PySide6.QtGui import QColor, QPainter, QPixmap, QIcon, QLinearGradient, QImage
+from PySide6.QtCore import Qt, Signal, QSize, QPropertyAnimation, QEasingCurve, QPointF
+from PySide6.QtGui import (
+    QColor, QPainter, QPixmap, QIcon, QLinearGradient, QRadialGradient,
+    QPen, QImage
+)
 
 from src.hdri_engine import BrushEngine, LayerType, SunObject
 from src.canvas_widget import CanvasWidget
@@ -25,8 +28,37 @@ from src.cloud_engine import CloudSettings
 from src.stamp_library import StampLibrary, StampAsset, StampInstance
 
 
+class FadingStackedWidget(QStackedWidget):
+    """StackedWidget with smooth cross-fade animation transitions."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._fade_anim = None
+
+    def set_fade_current_index(self, index: int, duration: int = 180):
+        if index == self.currentIndex():
+            return
+        widget = self.widget(index)
+        if not widget:
+            self.setCurrentIndex(index)
+            return
+
+        # Prepare smooth opacity effect transition
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        effect.setOpacity(0.0)
+        self.setCurrentIndex(index)
+
+        self._fade_anim = QPropertyAnimation(effect, b"opacity")
+        self._fade_anim.setDuration(duration)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._fade_anim.start(QPropertyAnimation.DeleteWhenStopped)
+
+
 class ColorPreviewWidget(QWidget):
-    """Widget showing the current HDR color with intensity."""
+    """Widget showing the current HDR color with glowing aura."""
 
     clicked = Signal()
 
@@ -51,9 +83,19 @@ class ColorPreviewWidget(QWidget):
         g = min(self.color[1] * self.intensity, 1.0)
         b = min(self.color[2] * self.intensity, 1.0)
 
-        painter.setPen(QColor(100, 100, 100))
+        # Radiant HDR glow border
+        if self.intensity > 1.0:
+            grad = QRadialGradient(27, 27, 26)
+            grad.setColorAt(0.0, QColor(255, 220, 100, 180))
+            grad.setColorAt(0.7, QColor(255, 180, 0, 90))
+            grad.setColorAt(1.0, QColor(0, 242, 254, 0))
+            painter.setBrush(grad)
+            painter.setPen(Qt.NoPen)
+            painter.drawRoundedRect(0, 0, 54, 54, 8, 8)
+
+        painter.setPen(QColor(0, 242, 254, 160) if self.intensity > 1.0 else QColor(80, 80, 90))
         painter.setBrush(QColor(int(r * 255), int(g * 255), int(b * 255)))
-        painter.drawRoundedRect(2, 2, 50, 50, 6, 6)
+        painter.drawRoundedRect(3, 3, 48, 48, 6, 6)
 
         # Inner base color
         painter.setBrush(QColor(
@@ -61,12 +103,13 @@ class ColorPreviewWidget(QWidget):
             int(min(self.color[1], 1.0) * 255),
             int(min(self.color[2], 1.0) * 255)
         ))
-        painter.drawRoundedRect(14, 14, 26, 26, 4, 4)
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
+        painter.drawRoundedRect(15, 15, 24, 24, 4, 4)
 
         if self.intensity > 1.0:
-            painter.setPen(QColor(255, 215, 0))
+            painter.setPen(QColor(255, 230, 80))
             painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(1, 1, 52, 52, 6, 6)
+            painter.drawRoundedRect(2, 2, 50, 50, 6, 6)
 
         painter.end()
 
@@ -80,7 +123,8 @@ class ToolsPanel(QDockWidget):
     Comprehensive tool selection and properties dock panel:
     - Paint tools: Brush, Eraser, Fill, Eyedropper
     - Procedural tools: Sun, Clouds, Stamps
-    - Contextual properties pages for each tool
+    - Smooth animated page transitions between tool settings
+    - Contextual properties pages with glowing neon glassmorphism
     - View controls (Exposure, Fit, Grid)
     """
 
@@ -130,7 +174,7 @@ class ToolsPanel(QDockWidget):
         tools_group = QGroupBox("Tools & Elements")
         tools_group.setStyleSheet(self._group_style())
         grid = QGridLayout()
-        grid.setSpacing(4)
+        grid.setSpacing(5)
         grid.setContentsMargins(4, 8, 4, 4)
 
         self._tool_buttons = {}
@@ -147,18 +191,21 @@ class ToolsPanel(QDockWidget):
         for tid, icon, tip, r, c in tool_defs:
             btn = QPushButton(icon)
             btn.setToolTip(tip)
-            btn.setFixedSize(38, 36)
+            btn.setFixedSize(40, 38)
             btn.setCheckable(True)
             btn.setStyleSheet("""
                 QPushButton {
-                    background: #333; border: 1px solid #555;
-                    border-radius: 5px; font-size: 16px; color: #ddd;
-                }
-                QPushButton:checked {
-                    background: #4682B4; border-color: #72a9e0;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #252632, stop:1 #1c1d25);
+                    border: 1px solid rgba(255, 255, 255, 0.12);
+                    border-radius: 6px; font-size: 16px; color: #ddd;
                 }
                 QPushButton:hover {
-                    background: #444; border-color: #888;
+                    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #343748, stop:1 #252735);
+                    border: 1px solid #00f2fe; color: #fff;
+                }
+                QPushButton:checked {
+                    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0052d4, stop:0.5 #4364f7, stop:1 #6fb1fc);
+                    border: 1px solid #00f2fe; color: #fff;
                 }
             """)
             btn.clicked.connect(lambda checked, t=tid: self._select_tool(t))
@@ -169,11 +216,11 @@ class ToolsPanel(QDockWidget):
         self.main_layout.addWidget(tools_group)
 
     # ================================================================
-    #  SETTINGS STACK
+    #  SETTINGS STACK (FADING ANIMATED TRANSITIONS)
     # ================================================================
 
     def _setup_stacked_settings(self):
-        self.stack = QStackedWidget()
+        self.stack = FadingStackedWidget()
 
         # Page 0: Brush / Eraser / Fill settings
         self.page_brush = self._create_brush_settings_page()
@@ -733,27 +780,34 @@ class ToolsPanel(QDockWidget):
     def _group_style(self):
         return """
             QGroupBox {
-                color: #ccc; font-size: 11px; font-weight: bold;
-                border: 1px solid rgba(255,255,255,0.1); border-radius: 6px;
-                margin-top: 8px; padding-top: 14px;
+                color: #e0e6ed; font-size: 11px; font-weight: bold;
+                background: rgba(22, 24, 32, 0.65);
+                border: 1px solid rgba(0, 242, 254, 0.22);
+                border-radius: 8px;
+                margin-top: 10px; padding-top: 14px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin; subcontrol-position: top left;
-                padding: 0 6px;
+                padding: 0 8px;
+                color: #00f2fe;
+                font-size: 11px;
             }
         """
 
     def _action_btn_style(self):
         return """
             QPushButton {
-                background: #383838; border: 1px solid #555;
-                border-radius: 4px; color: #eee; padding: 6px; font-size: 11px;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #2c2d3a, stop:1 #1e1f29);
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 5px; color: #eee; padding: 6px 12px; font-size: 11px;
+                font-weight: 500;
             }
             QPushButton:hover {
-                background: #4a4a4a; border-color: #4682B4;
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #3c3e52, stop:1 #282a3a);
+                border: 1px solid #00f2fe; color: #fff;
             }
             QPushButton:pressed {
-                background: #4682B4;
+                background: #0052d4; border-color: #00f2fe;
             }
         """
 
@@ -767,17 +821,17 @@ class ToolsPanel(QDockWidget):
 
         self.canvas.tool = tool_id
 
-        # Switch settings stack page
+        # Smooth fade transition between settings stack pages
         if tool_id in (CanvasWidget.TOOL_BRUSH, CanvasWidget.TOOL_ERASER,
                        CanvasWidget.TOOL_FILL, CanvasWidget.TOOL_EYEDROPPER):
-            self.stack.setCurrentIndex(0)
+            self.stack.set_fade_current_index(0)
         elif tool_id == CanvasWidget.TOOL_SUN:
-            self.stack.setCurrentIndex(1)
+            self.stack.set_fade_current_index(1)
             self._sync_sun_ui_from_project()
         elif tool_id == CanvasWidget.TOOL_CLOUD:
-            self.stack.setCurrentIndex(2)
+            self.stack.set_fade_current_index(2)
         elif tool_id == CanvasWidget.TOOL_STAMP:
-            self.stack.setCurrentIndex(3)
+            self.stack.set_fade_current_index(3)
 
         self.canvas.update()
         self.tool_changed.emit(tool_id)
@@ -907,13 +961,11 @@ class ToolsPanel(QDockWidget):
             layer.regenerate(self.canvas.project)
             self.canvas.project.invalidate_cache()
             self.canvas.refresh()
-            self.canvas.canvas_modified.emit()
 
     def _add_sun_layer(self):
         self.canvas.project.save_undo_state("Add Sun Layer")
         self.canvas.project.add_sun_layer("Sun")
         self.canvas.refresh()
-        self.canvas.canvas_modified.emit()
         self._sync_sun_ui_from_project()
 
     # Cloud handlers
