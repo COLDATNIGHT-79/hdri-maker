@@ -19,8 +19,8 @@ from src.hdri_engine import HDRIProject
 class Preview3DWidget(QWidget):
     """
     3D preview widget that shows a sphere rendered with the current HDRI
-    environment. Uses software rendering for maximum compatibility
-    (no OpenGL dependency issues).
+    environment. Uses software rendering for maximum compatibility.
+    Supports Mirror, Diffuse, and Glossy reflection modes.
     """
 
     def __init__(self, project: HDRIProject, parent=None):

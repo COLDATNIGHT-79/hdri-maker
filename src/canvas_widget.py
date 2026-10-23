@@ -3,6 +3,7 @@ Canvas Widget for HDRI Maker.
 Displays the equirectangular HDRI canvas and handles painting operations.
 """
 
+import math
 import numpy as np
 from PySide6.QtWidgets import QWidget, QApplication
 from PySide6.QtCore import Qt, Signal, QPoint, QRect, QSize, QTimer
@@ -11,30 +12,52 @@ from PySide6.QtGui import (
     QMouseEvent, QWheelEvent, QPaintEvent, QResizeEvent
 )
 
-from src.hdri_engine import HDRIProject, BrushEngine
+from src.hdri_engine import HDRIProject, BrushEngine, LayerType
 
 
 class CanvasWidget(QWidget):
     """
     HDRI painting canvas widget.
     Displays the composited layers in equirectangular projection
-    and handles brush/eraser/fill painting operations.
+    and handles brush/eraser/fill/sun/cloud/stamp operations.
     """
 
     canvas_modified = Signal()
     cursor_position_changed = Signal(int, int)  # x, y on canvas
+    sun_moved = Signal(float, float)            # azimuth, elevation (0-1)
+    stamp_placed = Signal(float, float)         # x, y (0-1)
 
     # Tool modes
     TOOL_BRUSH = 0
     TOOL_ERASER = 1
     TOOL_FILL = 2
     TOOL_EYEDROPPER = 3
+    TOOL_SUN = 4
+    TOOL_CLOUD = 5
+    TOOL_STAMP = 6
 
     def __init__(self, project: HDRIProject, brush: BrushEngine, parent=None):
         super().__init__(parent)
         self.project = project
         self.brush = brush
         self.tool = self.TOOL_BRUSH
+
+        # Stamp tool settings
+        self.selected_stamp = None
+        self.stamp_scale = 1.0
+        self.stamp_rotation = 0.0
+        self.stamp_flip_h = False
+        self.stamp_opacity = 1.0
+        self.stamp_silhouette_mode = True
+        self.stamp_color = (0.0, 0.0, 0.0)
+
+        # Cloud tool settings
+        from src.cloud_engine import CloudSettings
+        self.cloud_settings = CloudSettings.preset_cumulus()
+
+        # Sun tool interaction
+        self._dragging_sun = False
+        self.paint_mask_mode = False
 
         # View state
         self._zoom = 1.0
@@ -208,9 +231,15 @@ class CanvasWidget(QWidget):
             painter.setBrush(Qt.NoBrush)
             painter.drawRect(dest_rect)
 
-        # Draw brush cursor
-        if self.tool in (self.TOOL_BRUSH, self.TOOL_ERASER):
+        # Draw cursor overlays
+        if self.tool in (self.TOOL_BRUSH, self.TOOL_ERASER, self.TOOL_CLOUD):
             self._draw_brush_cursor(painter)
+        elif self.tool == self.TOOL_STAMP:
+            self._draw_stamp_cursor(painter)
+
+        # Draw sun indicator
+        if self.tool == self.TOOL_SUN or (self.project.primary_sun and self._show_grid):
+            self._draw_sun_marker(painter)
 
         painter.end()
 
@@ -240,12 +269,66 @@ class CanvasWidget(QWidget):
             return
 
         radius = int(self.brush.size * self._zoom)
+        painter.setRenderHint(QPainter.Antialiasing)
         if self.tool == self.TOOL_ERASER:
             painter.setPen(QColor(255, 100, 100, 180))
+        elif self.tool == self.TOOL_CLOUD:
+            painter.setPen(QColor(180, 220, 255, 200))
         else:
             painter.setPen(QColor(255, 255, 255, 180))
         painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(pos, radius, radius)
+
+    def _draw_stamp_cursor(self, painter: QPainter):
+        """Draw stamp ghost/box cursor."""
+        pos = self.mapFromGlobal(QCursor.pos())
+        if not self.rect().contains(pos):
+            return
+
+        size = max(16, int(64 * self.stamp_scale * self._zoom))
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QColor(100, 200, 255, 200))
+        painter.setBrush(QColor(100, 200, 255, 30))
+
+        painter.save()
+        painter.translate(pos.x(), pos.y())
+        painter.rotate(self.stamp_rotation)
+        painter.drawRect(-size // 2, -size // 2, size, size)
+        painter.drawLine(-size // 2, 0, size // 2, 0)
+        painter.drawLine(0, -size // 2, 0, size // 2)
+        painter.restore()
+
+    def _draw_sun_marker(self, painter: QPainter):
+        """Draw the sun position marker with rays and crosshairs."""
+        sun = self.project.primary_sun
+        if not sun:
+            return
+
+        sx = int(sun.azimuth * self.project.width)
+        sy = int(sun.elevation * self.project.height)
+        wpos = self._canvas_to_widget(sx, sy)
+        if not self.rect().contains(wpos):
+            return
+
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QColor(255, 215, 0, 240))
+        painter.setBrush(QColor(255, 240, 150, 90))
+        painter.drawEllipse(wpos, 14, 14)
+
+        # Draw rays
+        painter.setPen(QColor(255, 220, 80, 200))
+        for r_angle in [0, 45, 90, 135, 180, 225, 270, 315]:
+            rad = math.radians(r_angle)
+            x1 = wpos.x() + int(18 * math.cos(rad))
+            y1 = wpos.y() + int(18 * math.sin(rad))
+            x2 = wpos.x() + int(26 * math.cos(rad))
+            y2 = wpos.y() + int(26 * math.sin(rad))
+            painter.drawLine(x1, y1, x2, y2)
+
+        # Crosshairs
+        painter.setPen(QColor(255, 255, 255, 120))
+        painter.drawLine(wpos.x() - 32, wpos.y(), wpos.x() + 32, wpos.y())
+        painter.drawLine(wpos.x(), wpos.y() - 32, wpos.x(), wpos.y() + 32)
 
     # ================================================================
     #  MOUSE EVENTS
@@ -261,6 +344,17 @@ class CanvasWidget(QWidget):
                 self._eyedrop(event.pos())
             elif self.tool == self.TOOL_FILL:
                 self._fill_layer(event.pos())
+            elif self.tool == self.TOOL_SUN:
+                self._dragging_sun = True
+                self.project.save_undo_state("Move Sun")
+                self._place_or_drag_sun(event.pos())
+            elif self.tool == self.TOOL_STAMP:
+                self._place_stamp(event.pos())
+            elif self.tool == self.TOOL_CLOUD:
+                self._painting = True
+                self._last_paint_pos = event.pos()
+                self.project.save_undo_state("Paint clouds")
+                self._do_paint(event.pos())
             elif self.tool in (self.TOOL_BRUSH, self.TOOL_ERASER):
                 self._painting = True
                 self._last_paint_pos = event.pos()
@@ -278,10 +372,12 @@ class CanvasWidget(QWidget):
             self._pan_offset += delta
             self._pan_start = event.pos()
             self.update()
+        elif self._dragging_sun:
+            self._place_or_drag_sun(event.pos())
         elif self._painting:
             self._do_paint(event.pos())
         else:
-            self.update()  # Update brush cursor
+            self.update()  # Update brush/stamp cursor
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         if event.button() == Qt.MiddleButton:
@@ -289,6 +385,7 @@ class CanvasWidget(QWidget):
             self.setCursor(Qt.ArrowCursor)
         elif event.button() == Qt.LeftButton:
             self._painting = False
+            self._dragging_sun = False
             self._last_paint_pos = None
 
     def wheelEvent(self, event: QWheelEvent):
@@ -304,24 +401,112 @@ class CanvasWidget(QWidget):
             self.fit_to_view()
 
     # ================================================================
-    #  PAINT OPERATIONS
+    #  PAINT & TOOL OPERATIONS
     # ================================================================
 
+    def _place_or_drag_sun(self, widget_pos: QPoint):
+        """Update or place sun at widget position."""
+        cx, cy = self._widget_to_canvas(widget_pos)
+        az = float(np.clip(cx / self.project.width, 0.0, 1.0))
+        el = float(np.clip(cy / self.project.height, 0.0, 1.0))
+
+        # Find active sun layer or any sun layer
+        layer = self.project.active_layer
+        if not layer or layer.layer_type != LayerType.SUN:
+            sun_layer = None
+            for l in self.project.layers:
+                if l.layer_type == LayerType.SUN:
+                    sun_layer = l
+                    break
+            if sun_layer is None:
+                sun_layer = self.project.add_sun_layer("Sun")
+            layer = sun_layer
+            self.project.active_layer_index = self.project.layers.index(layer)
+
+        if not layer.suns:
+            from src.hdri_engine import SunObject
+            layer.suns.append(SunObject())
+
+        layer.suns[0].azimuth = az
+        layer.suns[0].elevation = el
+        layer.regenerate(self.project)
+        self.project.invalidate_cache()
+        self._display_dirty = True
+        self.update()
+        self.canvas_modified.emit()
+        self.sun_moved.emit(az, el)
+
+    def _place_stamp(self, widget_pos: QPoint):
+        """Place the selected stamp asset at the clicked location."""
+        if not self.selected_stamp:
+            return
+
+        cx, cy = self._widget_to_canvas(widget_pos)
+        norm_x = float(np.clip(cx / self.project.width, 0.0, 1.0))
+        norm_y = float(np.clip(cy / self.project.height, 0.0, 1.0))
+
+        layer = self.project.active_layer
+        if not layer or layer.locked:
+            return
+
+        self.project.save_undo_state("Place Stamp")
+
+        from src.stamp_library import StampInstance, render_stamp
+        inst = StampInstance()
+        inst.stamp_id = self.selected_stamp.stamp_id
+        inst.category = self.selected_stamp.category
+        inst.x = norm_x
+        inst.y = norm_y
+        inst.scale = self.stamp_scale
+        inst.rotation = self.stamp_rotation
+        inst.flip_h = self.stamp_flip_h
+        inst.opacity = self.stamp_opacity
+        inst.color = self.stamp_color
+        inst.silhouette_mode = self.stamp_silhouette_mode
+
+        if layer.layer_type == LayerType.STAMP:
+            layer.stamps.append(inst)
+            layer.regenerate(self.project)
+        else:
+            render_stamp(layer.data, self.selected_stamp.image_data, inst)
+
+        self.project.invalidate_cache()
+        self._display_dirty = True
+        self.update()
+        self.canvas_modified.emit()
+        self.stamp_placed.emit(norm_x, norm_y)
+
     def _do_paint(self, widget_pos: QPoint):
-        """Execute paint/erase at a widget position."""
+        """Execute paint/erase/cloud at a widget position."""
         layer = self.project.active_layer
         if not layer or layer.locked:
             return
 
         cx, cy = self._widget_to_canvas(widget_pos)
 
-        if self._last_paint_pos:
-            lx, ly = self._widget_to_canvas(self._last_paint_pos)
-            self.brush.paint_line(layer, lx, ly, cx, cy,
-                                  erase=(self.tool == self.TOOL_ERASER))
-        else:
-            self.brush.paint_stroke(layer, cx, cy,
-                                     erase=(self.tool == self.TOOL_ERASER))
+        if self.tool == self.TOOL_CLOUD:
+            sun = self.project.primary_sun
+            sun_az = sun.azimuth if sun else 0.25
+            sun_el = sun.elevation if sun else 0.25
+            sun_col = sun.color if sun else (1.0, 0.95, 0.85)
+
+            if self._last_paint_pos:
+                lx, ly = self._widget_to_canvas(self._last_paint_pos)
+                self.brush.paint_cloud_line(layer, lx, ly, cx, cy,
+                                            self.cloud_settings, sun_az, sun_el, sun_col)
+            else:
+                self.brush.paint_cloud_stroke(layer, cx, cy,
+                                              self.cloud_settings, sun_az, sun_el, sun_col)
+        elif self.tool in (self.TOOL_BRUSH, self.TOOL_ERASER):
+            if self._last_paint_pos:
+                lx, ly = self._widget_to_canvas(self._last_paint_pos)
+                self.brush.paint_line(layer, lx, ly, cx, cy,
+                                      erase=(self.tool == self.TOOL_ERASER),
+                                      paint_mask=self.paint_mask_mode)
+            else:
+                self.brush.paint_stroke(layer, cx, cy,
+                                        erase=(self.tool == self.TOOL_ERASER),
+                                        paint_mask=self.paint_mask_mode)
 
         self._last_paint_pos = widget_pos
         self.project.invalidate_cache()

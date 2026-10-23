@@ -2,12 +2,15 @@
 HDRI Engine - Core data model and processing for the HDRI Maker tool.
 
 Manages layers, compositing, undo/redo, and interfaces with the C++ DLL
-for performance-critical operations.
+for performance-critical operations. Supports multiple layer types:
+paint, sun, cloud, atmosphere, stamp, adjustment, and group layers.
 """
 
 import os
 import sys
+import math
 import ctypes
+import json
 import numpy as np
 from enum import IntEnum
 from typing import List, Optional, Tuple
@@ -34,6 +37,200 @@ BLEND_MODE_NAMES = {
     BlendMode.OVERLAY: "Overlay",
     BlendMode.SOFT_LIGHT: "Soft Light",
 }
+
+
+# ============================================================
+#  LAYER TYPES
+# ============================================================
+
+class LayerType(IntEnum):
+    PAINT = 0
+    SUN = 1
+    CLOUD = 2
+    ATMOSPHERE = 3
+    STAMP = 4
+    ADJUSTMENT = 5
+    GROUP = 6
+
+
+LAYER_TYPE_NAMES = {
+    LayerType.PAINT: "Paint",
+    LayerType.SUN: "☀ Sun",
+    LayerType.CLOUD: "☁ Cloud",
+    LayerType.ATMOSPHERE: "🌅 Atmosphere",
+    LayerType.STAMP: "🌲 Stamp",
+    LayerType.ADJUSTMENT: "⚙ Adjustment",
+    LayerType.GROUP: "📁 Group",
+}
+
+LAYER_TYPE_ICONS = {
+    LayerType.PAINT: "🎨",
+    LayerType.SUN: "☀",
+    LayerType.CLOUD: "☁",
+    LayerType.ATMOSPHERE: "🌅",
+    LayerType.STAMP: "🌲",
+    LayerType.ADJUSTMENT: "⚙",
+    LayerType.GROUP: "📁",
+}
+
+
+# ============================================================
+#  SUN OBJECT
+# ============================================================
+
+class SunObject:
+    """Represents a sun/light source in the environment."""
+
+    _counter = 0
+
+    def __init__(self):
+        SunObject._counter += 1
+        self.id = SunObject._counter
+        self.name = f"Sun {self.id}"
+
+        # Position (normalized 0-1)
+        self.azimuth = 0.25    # Horizontal position
+        self.elevation = 0.25  # Vertical position (0=top, 0.5=horizon)
+
+        # Light properties
+        self.intensity = 10.0
+        self.temperature = 5500  # Kelvin (1800-12000)
+        self.color_override = None  # If set, overrides temperature-based color
+        self.disc_size = 0.02  # Angular size in radians
+
+        # Halo
+        self.halo_radius = 0.08
+        self.halo_intensity = 0.5
+        self.halo_falloff = 2.0
+
+        # Advanced
+        self.limb_darkening = 0.5
+        self.flare_enabled = False
+        self.flare_intensity = 0.3
+        self.flare_rays = 6
+
+    @property
+    def color(self) -> Tuple[float, float, float]:
+        """Get sun color from temperature or override."""
+        if self.color_override:
+            return self.color_override
+        from src.atmosphere import kelvin_to_rgb
+        return kelvin_to_rgb(self.temperature)
+
+    def copy(self) -> 'SunObject':
+        s = SunObject()
+        s.name = f"{self.name} (Copy)"
+        s.azimuth = self.azimuth
+        s.elevation = self.elevation
+        s.intensity = self.intensity
+        s.temperature = self.temperature
+        s.color_override = self.color_override
+        s.disc_size = self.disc_size
+        s.halo_radius = self.halo_radius
+        s.halo_intensity = self.halo_intensity
+        s.halo_falloff = self.halo_falloff
+        s.limb_darkening = self.limb_darkening
+        s.flare_enabled = self.flare_enabled
+        s.flare_intensity = self.flare_intensity
+        s.flare_rays = self.flare_rays
+        return s
+
+    def to_dict(self) -> dict:
+        return {
+            'name': self.name,
+            'azimuth': self.azimuth,
+            'elevation': self.elevation,
+            'intensity': self.intensity,
+            'temperature': self.temperature,
+            'color_override': self.color_override,
+            'disc_size': self.disc_size,
+            'halo_radius': self.halo_radius,
+            'halo_intensity': self.halo_intensity,
+            'halo_falloff': self.halo_falloff,
+            'limb_darkening': self.limb_darkening,
+            'flare_enabled': self.flare_enabled,
+            'flare_intensity': self.flare_intensity,
+            'flare_rays': self.flare_rays,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'SunObject':
+        s = cls()
+        for k, v in d.items():
+            if hasattr(s, k):
+                setattr(s, k, v)
+        return s
+
+
+# ============================================================
+#  ADJUSTMENT SETTINGS
+# ============================================================
+
+class AdjustmentSettings:
+    """Settings for an adjustment layer."""
+
+    def __init__(self):
+        self.brightness = 0.0    # -1 to 1
+        self.contrast = 0.0      # -1 to 1
+        self.saturation = 1.0    # 0 to 2
+        self.hue_shift = 0.0     # -180 to 180 degrees
+        self.temperature = 0.0   # -1 (cool) to 1 (warm)
+        self.gamma = 1.0         # 0.1 to 3.0
+
+    def copy(self) -> 'AdjustmentSettings':
+        a = AdjustmentSettings()
+        a.brightness = self.brightness
+        a.contrast = self.contrast
+        a.saturation = self.saturation
+        a.hue_shift = self.hue_shift
+        a.temperature = self.temperature
+        a.gamma = self.gamma
+        return a
+
+    def to_dict(self) -> dict:
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d: dict) -> 'AdjustmentSettings':
+        a = cls()
+        for k, v in d.items():
+            if hasattr(a, k):
+                setattr(a, k, v)
+        return a
+
+    def apply(self, data: np.ndarray) -> np.ndarray:
+        """Apply adjustment to image data (returns new array)."""
+        result = data.copy()
+        rgb = result[..., :3]
+
+        # Brightness
+        if abs(self.brightness) > 0.001:
+            rgb += self.brightness
+
+        # Contrast
+        if abs(self.contrast) > 0.001:
+            mid = 0.5
+            factor = (1.0 + self.contrast)
+            rgb[:] = (rgb - mid) * factor + mid
+
+        # Saturation
+        if abs(self.saturation - 1.0) > 0.001:
+            lum = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+            lum = lum[..., np.newaxis]
+            rgb[:] = lum + (rgb - lum) * self.saturation
+
+        # Temperature (warm/cool shift)
+        if abs(self.temperature) > 0.001:
+            rgb[..., 0] += self.temperature * 0.1   # Red channel
+            rgb[..., 2] -= self.temperature * 0.1   # Blue channel
+
+        # Gamma
+        if abs(self.gamma - 1.0) > 0.001:
+            mask = rgb > 0
+            rgb[mask] = np.power(rgb[mask], 1.0 / self.gamma)
+
+        result[..., :3] = np.clip(rgb, 0, None)
+        return result
 
 
 # ============================================================
@@ -335,16 +532,110 @@ def _py_generate_sky(data: np.ndarray, horizon, zenith, ground,
 
 
 # ============================================================
+#  SUN RENDERER
+# ============================================================
+
+def render_sun(data: np.ndarray, sun: SunObject):
+    """
+    Render a sun object into an RGBA float32 array (in-place).
+    Includes disc, limb darkening, halo, and optional flare.
+    """
+    h, w, c = data.shape
+    us = np.linspace(0, 1, w, dtype=np.float32)
+    vs = np.linspace(0, 1, h, dtype=np.float32)
+    uu, vv = np.meshgrid(us, vs)
+
+    theta = uu * 2.0 * np.pi
+    phi = vv * np.pi
+
+    dx = np.sin(phi) * np.cos(theta)
+    dy = np.cos(phi)
+    dz = np.sin(phi) * np.sin(theta)
+
+    sun_theta = sun.azimuth * 2.0 * np.pi
+    sun_phi = sun.elevation * np.pi
+    sun_dx = np.sin(sun_phi) * np.cos(sun_theta)
+    sun_dy = np.cos(sun_phi)
+    sun_dz = np.sin(sun_phi) * np.sin(sun_theta)
+
+    dot = dx * sun_dx + dy * sun_dy + dz * sun_dz
+    color = sun.color
+
+    # Sun disc with limb darkening
+    cos_disc = math.cos(sun.disc_size)
+    disc_mask = dot > cos_disc
+    if np.any(disc_mask):
+        disc_factor = (dot[disc_mask] - cos_disc) / (1.0 - cos_disc)
+        # Limb darkening: center is brighter than edges
+        limb = (1.0 - sun.limb_darkening) + sun.limb_darkening * disc_factor
+        brightness = disc_factor ** 0.5 * limb * sun.intensity
+
+        data[:, :, 0][disc_mask] += color[0] * brightness
+        data[:, :, 1][disc_mask] += color[1] * brightness
+        data[:, :, 2][disc_mask] += color[2] * brightness
+
+    # Halo
+    if sun.halo_intensity > 0:
+        cos_halo = math.cos(sun.halo_radius)
+        halo_mask = (dot > cos_halo) & (~disc_mask)
+        if np.any(halo_mask):
+            halo_factor = (dot[halo_mask] - cos_halo) / (cos_disc - cos_halo)
+            halo_factor = halo_factor ** sun.halo_falloff
+            brightness = halo_factor * sun.halo_intensity * sun.intensity * 0.1
+
+            data[:, :, 0][halo_mask] += color[0] * brightness
+            data[:, :, 1][halo_mask] += color[1] * brightness
+            data[:, :, 2][halo_mask] += color[2] * brightness
+
+    # Atmospheric glow (wide)
+    glow = np.power(np.clip(dot, 0, None), 48) * sun.intensity * 0.08
+    data[:, :, 0] += glow * color[0]
+    data[:, :, 1] += glow * color[1]
+    data[:, :, 2] += glow * color[2]
+
+    # Flare (starburst)
+    if sun.flare_enabled and sun.flare_intensity > 0:
+        # Sun position in UV space
+        su = sun.azimuth
+        sv = sun.elevation
+
+        for ray_idx in range(sun.flare_rays):
+            angle = ray_idx * math.pi / sun.flare_rays
+            cos_a = math.cos(angle)
+            sin_a = math.sin(angle)
+
+            # Direction along flare ray
+            dist_u = (uu - su) * cos_a + (vv - sv) * sin_a
+            dist_perp = -(uu - su) * sin_a + (vv - sv) * cos_a
+
+            # Thin line along ray direction
+            line_mask = np.abs(dist_perp) < 0.003
+            line_falloff = np.exp(-np.abs(dist_u) * 30) * np.exp(-np.abs(dist_perp) * 500)
+            flare_val = line_falloff * sun.flare_intensity * sun.intensity * 0.05
+
+            data[:, :, 0] += flare_val * color[0]
+            data[:, :, 1] += flare_val * color[1]
+            data[:, :, 2] += flare_val * color[2]
+
+    # Set alpha where we painted
+    alpha_contrib = np.clip(
+        data[:, :, 0] + data[:, :, 1] + data[:, :, 2], 0, 1
+    )
+    data[:, :, 3] = np.maximum(data[:, :, 3], alpha_contrib)
+
+
+# ============================================================
 #  HDRI LAYER
 # ============================================================
 
 class HDRILayer:
-    """A single layer in the HDRI project."""
+    """A single layer in the HDRI project. Supports multiple layer types."""
 
     _counter = 0
 
     def __init__(self, width: int, height: int, name: str = None,
-                 fill_color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)):
+                 fill_color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+                 layer_type: LayerType = LayerType.PAINT):
         HDRILayer._counter += 1
         self.id = HDRILayer._counter
         self.name = name or f"Layer {self.id}"
@@ -354,21 +645,125 @@ class HDRILayer:
         self.opacity = 1.0
         self.blend_mode = BlendMode.NORMAL
         self.locked = False
+        self.layer_type = layer_type
 
         # HDR RGBA float32 image data
         self.data = np.full((height, width, 4), fill_color, dtype=np.float32)
+
+        # Layer mask (optional)
+        self.mask = None  # np.ndarray (H, W), float32, 0-1
+        self.mask_enabled = False
+
+        # Type-specific data
+        self.suns: List[SunObject] = []  # For SUN layers
+        self.cloud_settings = None       # For CLOUD layers
+        self.atmosphere_settings = None  # For ATMOSPHERE layers
+        self.stamps = []                 # For STAMP layers (list of StampInstance)
+        self.adjustment = None           # For ADJUSTMENT layers
+
+        # Group layer children
+        self.children: List['HDRILayer'] = []
+        self.collapsed = False  # For group UI
+
+        # Per-layer effects
+        self.effects: List[dict] = []
 
     def clear(self, color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)):
         """Clear the layer to a solid color."""
         self.data[:] = color
 
+    def regenerate(self, project=None):
+        """
+        Regenerate layer content from type-specific settings.
+        Called when settings change on Sun/Cloud/Atmosphere/Stamp layers.
+        """
+        if self.layer_type == LayerType.SUN:
+            self.data[:] = 0
+            for sun in self.suns:
+                render_sun(self.data, sun)
+
+        elif self.layer_type == LayerType.CLOUD:
+            if self.cloud_settings:
+                self.data[:] = 0
+                from src.cloud_engine import render_clouds
+                # Find sun position from project context
+                sun_az, sun_el, sun_col = 0.25, 0.25, (1.0, 0.95, 0.85)
+                if project:
+                    for layer in project.layers:
+                        if layer.layer_type == LayerType.SUN and layer.suns:
+                            s = layer.suns[0]
+                            sun_az = s.azimuth
+                            sun_el = s.elevation
+                            sun_col = s.color
+                            break
+                render_clouds(self.data, self.cloud_settings, sun_az, sun_el, sun_col)
+
+        elif self.layer_type == LayerType.ATMOSPHERE:
+            if self.atmosphere_settings:
+                self.data[:] = 0
+                from src.atmosphere import render_atmosphere
+                sun_az, sun_el, sun_int, sun_col = 0.25, 0.25, 10.0, (1.0, 0.95, 0.85)
+                if project:
+                    for layer in project.layers:
+                        if layer.layer_type == LayerType.SUN and layer.suns:
+                            s = layer.suns[0]
+                            sun_az = s.azimuth
+                            sun_el = s.elevation
+                            sun_int = s.intensity
+                            sun_col = s.color
+                            break
+                render_atmosphere(self.data, self.atmosphere_settings,
+                                   sun_az, sun_el, sun_int, sun_col)
+
+        elif self.layer_type == LayerType.STAMP:
+            if self.stamps:
+                self.data[:] = 0
+                from src.stamp_library import render_all_stamps
+                if project and hasattr(project, 'stamp_library'):
+                    render_all_stamps(self.data, self.stamps, project.stamp_library)
+
+    def init_mask(self):
+        """Initialize a white (fully visible) layer mask."""
+        self.mask = np.ones((self.height, self.width), dtype=np.float32)
+        self.mask_enabled = True
+
+    def remove_mask(self):
+        """Remove the layer mask."""
+        self.mask = None
+        self.mask_enabled = False
+
+    def get_masked_data(self) -> np.ndarray:
+        """Get layer data with mask applied."""
+        if self.mask is not None and self.mask_enabled:
+            result = self.data.copy()
+            result[..., 3] *= self.mask
+            return result
+        return self.data
+
     def copy(self) -> 'HDRILayer':
         """Create a deep copy of this layer."""
-        new_layer = HDRILayer(self.width, self.height, f"{self.name} (Copy)")
+        new_layer = HDRILayer(self.width, self.height, f"{self.name} (Copy)",
+                              layer_type=self.layer_type)
         new_layer.data = self.data.copy()
         new_layer.visible = self.visible
         new_layer.opacity = self.opacity
         new_layer.blend_mode = self.blend_mode
+
+        if self.mask is not None:
+            new_layer.mask = self.mask.copy()
+            new_layer.mask_enabled = self.mask_enabled
+
+        # Copy type-specific data
+        new_layer.suns = [s.copy() for s in self.suns]
+        if self.cloud_settings:
+            new_layer.cloud_settings = self.cloud_settings.copy()
+        if self.atmosphere_settings:
+            new_layer.atmosphere_settings = self.atmosphere_settings.copy()
+        new_layer.stamps = [s.copy() for s in self.stamps]
+        if self.adjustment:
+            new_layer.adjustment = self.adjustment.copy()
+        new_layer.children = [c.copy() for c in self.children]
+
         return new_layer
 
     def get_thumbnail(self, size: int = 48) -> np.ndarray:
@@ -413,8 +808,23 @@ class HDRIProject:
         self._composite_cache: Optional[np.ndarray] = None
         self._cache_dirty = True
 
+        # Stamp library (shared across layers)
+        self.stamp_library = None
+        self._init_stamp_library()
+
+        # Global sun objects (accessible from all layers for lighting)
+        self._primary_sun: Optional[SunObject] = None
+
         # Create initial background layer
         self.add_layer("Background", fill_color=(0.05, 0.05, 0.08, 1.0))
+
+    def _init_stamp_library(self):
+        """Initialize the stamp library."""
+        try:
+            from src.stamp_library import StampLibrary
+            self.stamp_library = StampLibrary()
+        except Exception as e:
+            print(f"[HDRI Engine] Failed to initialize stamp library: {e}")
 
     @property
     def active_layer(self) -> Optional[HDRILayer]:
@@ -422,15 +832,24 @@ class HDRIProject:
             return self.layers[self.active_layer_index]
         return None
 
+    @property
+    def primary_sun(self) -> Optional[SunObject]:
+        """Get the primary sun object from all sun layers."""
+        for layer in self.layers:
+            if layer.layer_type == LayerType.SUN and layer.suns:
+                return layer.suns[0]
+        return self._primary_sun
+
     def invalidate_cache(self):
         """Mark the composite cache as dirty."""
         self._cache_dirty = True
 
     def add_layer(self, name: str = None,
                   fill_color: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
-                  above_active: bool = True) -> HDRILayer:
+                  above_active: bool = True,
+                  layer_type: LayerType = LayerType.PAINT) -> HDRILayer:
         """Add a new layer to the project."""
-        layer = HDRILayer(self.width, self.height, name, fill_color)
+        layer = HDRILayer(self.width, self.height, name, fill_color, layer_type)
 
         if above_active and self.active_layer_index >= 0:
             insert_idx = self.active_layer_index + 1
@@ -441,6 +860,45 @@ class HDRIProject:
             self.active_layer_index = len(self.layers) - 1
 
         self._cache_dirty = True
+        return layer
+
+    def add_sun_layer(self, name: str = "Sun") -> HDRILayer:
+        """Add a new sun layer with a default sun object."""
+        layer = self.add_layer(name, layer_type=LayerType.SUN)
+        sun = SunObject()
+        layer.suns.append(sun)
+        layer.regenerate(self)
+        return layer
+
+    def add_cloud_layer(self, name: str = "Clouds", preset: str = "cumulus") -> HDRILayer:
+        """Add a new cloud layer with default settings."""
+        from src.cloud_engine import CloudSettings
+        layer = self.add_layer(name, layer_type=LayerType.CLOUD)
+        settings = CloudSettings()
+        settings.preset = preset
+        layer.cloud_settings = settings
+        layer.regenerate(self)
+        return layer
+
+    def add_atmosphere_layer(self, name: str = "Atmosphere") -> HDRILayer:
+        """Add a new atmosphere layer."""
+        from src.atmosphere import AtmosphereSettings
+        layer = self.add_layer(name, layer_type=LayerType.ATMOSPHERE)
+        layer.atmosphere_settings = AtmosphereSettings()
+        layer.regenerate(self)
+        return layer
+
+    def add_stamp_layer(self, name: str = "Stamps") -> HDRILayer:
+        """Add a new stamp layer."""
+        layer = self.add_layer(name, layer_type=LayerType.STAMP)
+        return layer
+
+    def add_adjustment_layer(self, name: str = "Adjustment") -> HDRILayer:
+        """Add an adjustment layer."""
+        layer = self.add_layer(name, layer_type=LayerType.ADJUSTMENT)
+        layer.adjustment = AdjustmentSettings()
+        # Adjustment layers start fully white (no effect by default)
+        layer.data[:] = (1.0, 1.0, 1.0, 1.0)
         return layer
 
     def add_image_layer(self, image_data: np.ndarray, name: str = "Imported") -> HDRILayer:
@@ -507,8 +965,9 @@ class HDRIProject:
             top = self.layers[index]
             bottom = self.layers[index - 1]
 
+            top_data = top.get_masked_data()
             result = self.processor.composite_layers(
-                bottom.data, top.data, top.opacity, int(top.blend_mode)
+                bottom.data, top_data, top.opacity, int(top.blend_mode)
             )
             bottom.data = result
             self.layers.pop(index)
@@ -535,15 +994,24 @@ class HDRIProject:
             if not layer.visible:
                 continue
 
+            # Get layer data (with mask applied)
+            layer_data = layer.get_masked_data()
+
+            # Handle adjustment layers
+            if layer.layer_type == LayerType.ADJUSTMENT and layer.adjustment:
+                if result is not None:
+                    result = layer.adjustment.apply(result)
+                continue
+
             if result is None:
-                result = layer.data.copy()
+                result = layer_data.copy()
                 # Apply layer opacity
                 if layer.opacity < 1.0:
                     result[..., :3] *= layer.opacity
                     result[..., 3] *= layer.opacity
             else:
                 result = self.processor.composite_layers(
-                    result, layer.data, layer.opacity, int(layer.blend_mode)
+                    result, layer_data, layer.opacity, int(layer.blend_mode)
                 )
 
         if result is None:
@@ -553,6 +1021,14 @@ class HDRIProject:
         self._cache_dirty = False
         return result
 
+    def regenerate_procedural_layers(self):
+        """Regenerate all procedural layers (sun, cloud, atmosphere, stamp)."""
+        for layer in self.layers:
+            if layer.layer_type in (LayerType.SUN, LayerType.CLOUD,
+                                     LayerType.ATMOSPHERE, LayerType.STAMP):
+                layer.regenerate(self)
+        self._cache_dirty = True
+
     def save_undo_state(self, description: str = ""):
         """Save the current state for undo."""
         if len(self._undo_stack) >= self._max_undo:
@@ -560,10 +1036,28 @@ class HDRIProject:
 
         state = {
             'description': description,
-            'layers': [(l.data.copy(), l.name, l.visible, l.opacity,
-                        int(l.blend_mode), l.locked) for l in self.layers],
+            'layers': [],
             'active_index': self.active_layer_index
         }
+        for l in self.layers:
+            layer_state = {
+                'data': l.data.copy(),
+                'name': l.name,
+                'visible': l.visible,
+                'opacity': l.opacity,
+                'blend_mode': int(l.blend_mode),
+                'locked': l.locked,
+                'layer_type': int(l.layer_type),
+                'mask': l.mask.copy() if l.mask is not None else None,
+                'mask_enabled': l.mask_enabled,
+                'suns': [s.to_dict() for s in l.suns],
+                'cloud_settings': l.cloud_settings.to_dict() if l.cloud_settings else None,
+                'atmosphere_settings': l.atmosphere_settings.to_dict() if l.atmosphere_settings else None,
+                'stamps': [s.to_dict() for s in l.stamps],
+                'adjustment': l.adjustment.to_dict() if l.adjustment else None,
+            }
+            state['layers'].append(layer_state)
+
         self._undo_stack.append(state)
         self._redo_stack.clear()
 
@@ -573,11 +1067,7 @@ class HDRIProject:
             return False
 
         # Save current state for redo
-        current = {
-            'layers': [(l.data.copy(), l.name, l.visible, l.opacity,
-                        int(l.blend_mode), l.locked) for l in self.layers],
-            'active_index': self.active_layer_index
-        }
+        current = self._create_state_snapshot()
         self._redo_stack.append(current)
 
         # Restore previous state
@@ -590,31 +1080,151 @@ class HDRIProject:
         if not self._redo_stack:
             return False
 
-        # Save current state for undo
-        current = {
-            'layers': [(l.data.copy(), l.name, l.visible, l.opacity,
-                        int(l.blend_mode), l.locked) for l in self.layers],
-            'active_index': self.active_layer_index
-        }
+        current = self._create_state_snapshot()
         self._undo_stack.append(current)
 
         state = self._redo_stack.pop()
         self._restore_state(state)
         return True
 
+    def _create_state_snapshot(self) -> dict:
+        """Create a full state snapshot for undo/redo."""
+        state = {'layers': [], 'active_index': self.active_layer_index}
+        for l in self.layers:
+            layer_state = {
+                'data': l.data.copy(),
+                'name': l.name,
+                'visible': l.visible,
+                'opacity': l.opacity,
+                'blend_mode': int(l.blend_mode),
+                'locked': l.locked,
+                'layer_type': int(l.layer_type),
+                'mask': l.mask.copy() if l.mask is not None else None,
+                'mask_enabled': l.mask_enabled,
+                'suns': [s.to_dict() for s in l.suns],
+                'cloud_settings': l.cloud_settings.to_dict() if l.cloud_settings else None,
+                'atmosphere_settings': l.atmosphere_settings.to_dict() if l.atmosphere_settings else None,
+                'stamps': [s.to_dict() for s in l.stamps],
+                'adjustment': l.adjustment.to_dict() if l.adjustment else None,
+            }
+            state['layers'].append(layer_state)
+        return state
+
     def _restore_state(self, state: dict):
         """Restore project state from a saved state dict."""
+        from src.cloud_engine import CloudSettings
+        from src.atmosphere import AtmosphereSettings
+        from src.stamp_library import StampInstance
+
         self.layers.clear()
-        for data, name, visible, opacity, blend_mode, locked in state['layers']:
-            layer = HDRILayer(self.width, self.height, name)
-            layer.data = data
-            layer.visible = visible
-            layer.opacity = opacity
-            layer.blend_mode = BlendMode(blend_mode)
-            layer.locked = locked
+        for ls in state['layers']:
+            layer = HDRILayer(self.width, self.height, ls['name'],
+                              layer_type=LayerType(ls.get('layer_type', 0)))
+            layer.data = ls['data']
+            layer.visible = ls['visible']
+            layer.opacity = ls['opacity']
+            layer.blend_mode = BlendMode(ls['blend_mode'])
+            layer.locked = ls['locked']
+            layer.mask = ls.get('mask')
+            layer.mask_enabled = ls.get('mask_enabled', False)
+            layer.suns = [SunObject.from_dict(d) for d in ls.get('suns', [])]
+            cs = ls.get('cloud_settings')
+            layer.cloud_settings = CloudSettings.from_dict(cs) if cs else None
+            ats = ls.get('atmosphere_settings')
+            layer.atmosphere_settings = AtmosphereSettings.from_dict(ats) if ats else None
+            layer.stamps = [StampInstance.from_dict(d) for d in ls.get('stamps', [])]
+            adj = ls.get('adjustment')
+            layer.adjustment = AdjustmentSettings.from_dict(adj) if adj else None
             self.layers.append(layer)
+
         self.active_layer_index = state['active_index']
         self._cache_dirty = True
+
+    def save_project(self, filepath: str):
+        """Save project to a .hdriproject file (ZIP archive)."""
+        import zipfile
+        import io
+
+        meta = {
+            'width': self.width,
+            'height': self.height,
+            'active_index': self.active_layer_index,
+            'layers': []
+        }
+
+        with zipfile.ZipFile(filepath, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for idx, l in enumerate(self.layers):
+                layer_info = {
+                    'name': l.name,
+                    'visible': l.visible,
+                    'opacity': l.opacity,
+                    'blend_mode': int(l.blend_mode),
+                    'locked': l.locked,
+                    'layer_type': int(l.layer_type),
+                    'mask_enabled': l.mask_enabled,
+                    'has_mask': l.mask is not None,
+                    'suns': [s.to_dict() for s in l.suns],
+                    'cloud_settings': l.cloud_settings.to_dict() if l.cloud_settings else None,
+                    'atmosphere_settings': l.atmosphere_settings.to_dict() if l.atmosphere_settings else None,
+                    'stamps': [s.to_dict() for s in l.stamps],
+                    'adjustment': l.adjustment.to_dict() if l.adjustment else None,
+                }
+                meta['layers'].append(layer_info)
+
+                # Save layer data as numpy bytes
+                data_buf = io.BytesIO()
+                np.save(data_buf, l.data)
+                zf.writestr(f"layer_{idx}_data.npy", data_buf.getvalue())
+
+                # Save mask data if present
+                if l.mask is not None:
+                    mask_buf = io.BytesIO()
+                    np.save(mask_buf, l.mask)
+                    zf.writestr(f"layer_{idx}_mask.npy", mask_buf.getvalue())
+
+            zf.writestr("project.json", json.dumps(meta, indent=2))
+
+    def load_project(self, filepath: str):
+        """Load project from a .hdriproject file."""
+        import zipfile
+        import io
+        from src.cloud_engine import CloudSettings
+        from src.atmosphere import AtmosphereSettings
+        from src.stamp_library import StampInstance
+
+        with zipfile.ZipFile(filepath, 'r') as zf:
+            meta = json.loads(zf.read("project.json").decode('utf-8'))
+            self.width = meta.get('width', self.DEFAULT_WIDTH)
+            self.height = meta.get('height', self.DEFAULT_HEIGHT)
+            self.layers.clear()
+
+            for idx, linfo in enumerate(meta['layers']):
+                layer = HDRILayer(self.width, self.height, linfo['name'],
+                                  layer_type=LayerType(linfo.get('layer_type', 0)))
+                data_bytes = zf.read(f"layer_{idx}_data.npy")
+                layer.data = np.load(io.BytesIO(data_bytes))
+                layer.visible = linfo.get('visible', True)
+                layer.opacity = linfo.get('opacity', 1.0)
+                layer.blend_mode = BlendMode(linfo.get('blend_mode', 0))
+                layer.locked = linfo.get('locked', False)
+                layer.mask_enabled = linfo.get('mask_enabled', False)
+                if linfo.get('has_mask', False):
+                    mask_bytes = zf.read(f"layer_{idx}_mask.npy")
+                    layer.mask = np.load(io.BytesIO(mask_bytes))
+                layer.suns = [SunObject.from_dict(d) for d in linfo.get('suns', [])]
+                cs = linfo.get('cloud_settings')
+                layer.cloud_settings = CloudSettings.from_dict(cs) if cs else None
+                ats = linfo.get('atmosphere_settings')
+                layer.atmosphere_settings = AtmosphereSettings.from_dict(ats) if ats else None
+                layer.stamps = [StampInstance.from_dict(d) for d in linfo.get('stamps', [])]
+                adj = linfo.get('adjustment')
+                layer.adjustment = AdjustmentSettings.from_dict(adj) if adj else None
+                self.layers.append(layer)
+
+            self.active_layer_index = meta.get('active_index', 0)
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._cache_dirty = True
 
 
 # ============================================================
@@ -663,7 +1273,8 @@ class BrushEngine:
         self._stamp_cache[key] = stamp
         return stamp
 
-    def paint_stroke(self, layer: HDRILayer, x: int, y: int, erase: bool = False):
+    def paint_stroke(self, layer: HDRILayer, x: int, y: int, erase: bool = False,
+                     paint_mask: bool = False, mask_value: float = 1.0):
         """Paint a single brush stamp at position (x, y) on the layer."""
         if layer.locked:
             return
@@ -672,9 +1283,26 @@ class BrushEngine:
         radius = self.size
         diameter = radius * 2 + 1
 
-        # Calculate bounds with wrapping for equirectangular
         h, w = layer.height, layer.width
 
+        # If painting on mask
+        if paint_mask and layer.mask is not None:
+            for sy in range(diameter):
+                for sx in range(diameter):
+                    if stamp[sy, sx] <= 0:
+                        continue
+                    px = (x - radius + sx) % w
+                    py = y - radius + sy
+                    if py < 0 or py >= h:
+                        continue
+                    alpha = stamp[sy, sx] * self.opacity
+                    if erase:
+                        layer.mask[py, px] = max(0, layer.mask[py, px] - alpha)
+                    else:
+                        layer.mask[py, px] = min(1, layer.mask[py, px] + alpha * mask_value)
+            return
+
+        # Regular painting
         for sy in range(diameter):
             for sx in range(diameter):
                 if stamp[sy, sx] <= 0:
@@ -707,7 +1335,8 @@ class BrushEngine:
                         layer.data[py, px, 2] = layer.data[py, px, 2] * (1.0 - blend) + b * blend
                         layer.data[py, px, 3] = new_a
 
-    def paint_line(self, layer: HDRILayer, x0: int, y0: int, x1: int, y1: int, erase: bool = False):
+    def paint_line(self, layer: HDRILayer, x0: int, y0: int, x1: int, y1: int,
+                   erase: bool = False, paint_mask: bool = False, mask_value: float = 1.0):
         """Paint along a line from (x0,y0) to (x1,y1) using Bresenham-like stepping."""
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
@@ -721,7 +1350,58 @@ class BrushEngine:
             t = i / num_steps if num_steps > 0 else 0
             x = int(x0 + (x1 - x0) * t)
             y = int(y0 + (y1 - y0) * t)
-            self.paint_stroke(layer, x, y, erase)
+            self.paint_stroke(layer, x, y, erase, paint_mask, mask_value)
+
+    def paint_cloud_stroke(self, layer: HDRILayer, x: int, y: int,
+                           cloud_settings=None, sun_az: float = 0.25, sun_el: float = 0.25,
+                           sun_color=(1.0, 0.95, 0.85)):
+        """Paint a procedural cloud brush dab onto the layer."""
+        if layer.locked:
+            return
+        from src.cloud_engine import render_cloud_brush_stamp, CloudSettings
+        if cloud_settings is None:
+            cloud_settings = CloudSettings.preset_cumulus()
+
+        radius = max(8, self.size)
+        diameter = radius * 2
+        stamp = render_cloud_brush_stamp(diameter, cloud_settings, sun_az, sun_el, sun_color)
+
+        h, w = layer.height, layer.width
+        for sy in range(diameter):
+            for sx in range(diameter):
+                alpha = stamp[sy, sx, 3] * self.opacity
+                if alpha <= 0.005:
+                    continue
+                px = (x - radius + sx) % w
+                py = y - radius + sy
+                if py < 0 or py >= h:
+                    continue
+
+                rgb = stamp[sy, sx, :3] * self.intensity
+                old_a = layer.data[py, px, 3]
+                new_a = min(1.0, old_a + alpha * (1.0 - old_a))
+
+                if new_a > 0:
+                    blend = alpha / new_a
+                    layer.data[py, px, 0] = layer.data[py, px, 0] * (1.0 - blend) + rgb[0] * blend
+                    layer.data[py, px, 1] = layer.data[py, px, 1] * (1.0 - blend) + rgb[1] * blend
+                    layer.data[py, px, 2] = layer.data[py, px, 2] * (1.0 - blend) + rgb[2] * blend
+                    layer.data[py, px, 3] = new_a
+
+    def paint_cloud_line(self, layer: HDRILayer, x0: int, y0: int, x1: int, y1: int,
+                         cloud_settings=None, sun_az: float = 0.25, sun_el: float = 0.25,
+                         sun_color=(1.0, 0.95, 0.85)):
+        """Paint cloud brush smoothly along a line."""
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        dist = max(dx, dy, 1)
+        step = max(4, self.size // 2)
+        num_steps = max(dist // step, 1)
+        for i in range(num_steps + 1):
+            t = i / num_steps if num_steps > 0 else 0
+            x = int(x0 + (x1 - x0) * t)
+            y = int(y0 + (y1 - y0) * t)
+            self.paint_cloud_stroke(layer, x, y, cloud_settings, sun_az, sun_el, sun_color)
 
 
 # ============================================================

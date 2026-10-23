@@ -3,11 +3,12 @@ Filters module for HDRI Maker.
 Provides dialog-based filter effects that can be applied to layers.
 """
 
+from pathlib import Path
 import numpy as np
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider,
     QDialogButtonBox, QGroupBox, QComboBox, QFormLayout,
-    QCheckBox, QPushButton
+    QCheckBox, QPushButton, QFileDialog, QLineEdit
 )
 from PySide6.QtCore import Qt, Signal
 from typing import Tuple
@@ -383,3 +384,222 @@ def apply_gradient_fill(data: np.ndarray, color: Tuple[float, float, float],
 
     for c in range(3):
         data[:, :, c] += grad * color[c] * intensity
+
+
+# ============================================================
+#  ADVANCED ENVIRONMENT & EXPORT DIALOGS
+# ============================================================
+
+class AtmosphereDialog(FilterDialog):
+    """Dialog for physically-based Rayleigh and Mie atmospheric scattering."""
+
+    def __init__(self, parent=None):
+        super().__init__("Atmosphere & Sky Scattering", parent)
+
+        self.time_slider = self._add_slider("Time of Day (h):", 0, 240, 120)  # 0 - 24 hours
+        self.turbidity_slider = self._add_slider("Turbidity (Haze):", 10, 80, 25)
+        self.rayleigh_slider = self._add_slider("Rayleigh Scattering:", 2, 30, 10)
+        self.mie_slider = self._add_slider("Mie Scattering:", 2, 30, 10)
+        self.haze_slider = self._add_slider("Ground Haze:", 0, 100, 20)
+
+        self.stars_check = QCheckBox("Add Night Stars")
+        self.stars_check.setChecked(False)
+        self._form.addRow("", self.stars_check)
+
+    @property
+    def time_of_day(self) -> float:
+        return self.time_slider.value() / 10.0
+
+    @property
+    def turbidity(self) -> float:
+        return self.turbidity_slider.value() / 10.0
+
+    @property
+    def rayleigh(self) -> float:
+        return self.rayleigh_slider.value() / 10.0
+
+    @property
+    def mie(self) -> float:
+        return self.mie_slider.value() / 10.0
+
+    @property
+    def haze(self) -> float:
+        return self.haze_slider.value() / 100.0
+
+    @property
+    def include_stars(self) -> bool:
+        return self.stars_check.isChecked()
+
+
+class GodRaysDialog(FilterDialog):
+    """Dialog for crepuscular light rays through atmosphere."""
+
+    def __init__(self, parent=None):
+        super().__init__("God Rays / Crepuscular Rays", parent)
+
+        self.intensity_slider = self._add_slider("Ray Intensity:", 5, 200, 50)
+        self.decay_slider = self._add_slider("Ray Decay:", 80, 99, 95)
+        self.density_slider = self._add_slider("Ray Density:", 10, 150, 80)
+        self.weight_slider = self._add_slider("Ray Weight:", 10, 100, 50)
+
+    @property
+    def intensity(self) -> float:
+        return self.intensity_slider.value() / 100.0
+
+    @property
+    def decay(self) -> float:
+        return self.decay_slider.value() / 100.0
+
+    @property
+    def density(self) -> float:
+        return self.density_slider.value() / 100.0
+
+    @property
+    def weight(self) -> float:
+        return self.weight_slider.value() / 100.0
+
+
+class CloudGeneratorDialog(FilterDialog):
+    """Dialog for procedural cloud field generation."""
+
+    def __init__(self, parent=None):
+        super().__init__("Procedural Cloud Generator", parent)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "Cumulus (Fluffy / Sunny)",
+            "Cirrus (High / Wispy)",
+            "Stratus (Overcast / Low)",
+            "Wispy (Ethereal)",
+            "Storm (Heavy / Ominous)",
+            "Sunset (Golden Glow)"
+        ])
+        self._form.addRow("Preset:", self.preset_combo)
+
+        self.coverage_slider = self._add_slider("Cloud Coverage:", 10, 100, 50)
+        self.density_slider = self._add_slider("Cloud Density:", 10, 200, 100)
+        self.softness_slider = self._add_slider("Edge Softness:", 0, 100, 40)
+        self.seed_slider = self._add_slider("Random Seed:", 1, 999, 42)
+
+        self.auto_sun_check = QCheckBox("Sun Directional Illumination")
+        self.auto_sun_check.setChecked(True)
+        self._form.addRow("", self.auto_sun_check)
+
+    @property
+    def preset_index(self) -> int:
+        return self.preset_combo.currentIndex()
+
+    @property
+    def coverage(self) -> float:
+        return self.coverage_slider.value() / 100.0
+
+    @property
+    def density(self) -> float:
+        return self.density_slider.value() / 100.0
+
+    @property
+    def softness(self) -> float:
+        return self.softness_slider.value() / 100.0
+
+    @property
+    def seed(self) -> int:
+        return self.seed_slider.value()
+
+    @property
+    def auto_sun(self) -> bool:
+        return self.auto_sun_check.isChecked()
+
+
+class SunPropertiesDialog(FilterDialog):
+    """Dialog to inspect and configure sun settings."""
+
+    def __init__(self, sun, parent=None):
+        super().__init__("Sun Light Properties", parent)
+        self.sun = sun
+
+        self.temp_slider = self._add_slider("Temperature (Kelvin):", 1800, 12000, int(sun.temperature))
+        self.intensity_slider = self._add_slider("Intensity:", 1, 200, int(sun.intensity * 2))
+        self.disc_slider = self._add_slider("Disc Size:", 2, 60, int(sun.disc_size * 500))
+        self.halo_r_slider = self._add_slider("Halo Radius:", 10, 200, int(sun.halo_radius * 1000))
+        self.halo_i_slider = self._add_slider("Halo Intensity:", 0, 100, int(sun.halo_intensity * 100))
+
+        self.flare_check = QCheckBox("Enable Starburst Flare")
+        self.flare_check.setChecked(sun.flare_enabled)
+        self._form.addRow("", self.flare_check)
+
+    def apply_to_sun(self):
+        self.sun.temperature = float(self.temp_slider.value())
+        self.sun.intensity = self.intensity_slider.value() / 2.0
+        self.sun.disc_size = self.disc_slider.value() / 500.0
+        self.sun.halo_radius = self.halo_r_slider.value() / 1000.0
+        self.sun.halo_intensity = self.halo_i_slider.value() / 100.0
+        self.sun.flare_enabled = self.flare_check.isChecked()
+
+
+class ExportPresetsDialog(FilterDialog):
+    """Dialog for one-click cross-engine export presets."""
+
+    def __init__(self, parent=None):
+        super().__init__("Cross-Engine Export Preset", parent)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems([
+            "Blender (.hdr + Python Scene Setup)",
+            "Unity (.hdr + Cubemap 6-Face + C# Importer)",
+            "Unreal Engine (.hdr + Setup Script + Light Config)",
+            "Godot (.hdr + GDScript + WorldEnvironment)",
+            "All Engines (Full Package for All Engines)",
+            "Web / Preview (Tone-mapped PNG + Cubemap)"
+        ])
+        self._form.addRow("Target Engine:", self.preset_combo)
+
+        # Output folder
+        from PySide6.QtWidgets import QLineEdit
+        self.dir_edit = QLineEdit(str(Path.home() / "Desktop"))
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse)
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(self.dir_edit)
+        dir_row.addWidget(btn_browse)
+        self._form.addRow("Export Folder:", dir_row)
+
+        self.name_edit = QLineEdit("hdri_environment")
+        self._form.addRow("Filename:", self.name_edit)
+
+        self.desc_label = QLabel()
+        self.desc_label.setWordWrap(True)
+        self.desc_label.setStyleSheet("color: #aaa; font-size: 10px; margin-top: 6px;")
+        self._form.addRow(self.desc_label)
+
+        self.preset_combo.currentIndexChanged.connect(self._update_desc)
+        self._update_desc(0)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, "Select Output Directory", self.dir_edit.text())
+        if d:
+            self.dir_edit.setText(d)
+
+    def _update_desc(self, idx):
+        descriptions = [
+            "Exports Radiance .hdr file and a Python script that sets up world environment, sun lamp rotation, and Cycles/EEVEE render parameters in Blender.",
+            "Exports .hdr file, 6 cubemap face textures (+X, -X, +Y, -Y, +Z, -Z), and copies the Unity C# importer script.",
+            "Exports .hdr file, Unreal Python setup script, and directional light configuration matching HDRI sun angle.",
+            "Exports .hdr file, Godot GDScript, and WorldEnvironment node setup for PanoramaSkyMaterial.",
+            "Exports all formats simultaneously: .hdr, .exr, .png, cubemaps, Blender script, Unreal script, and Godot script.",
+            "Exports tone-mapped LDR .png and cubemap textures for lightweight web preview."
+        ]
+        self.desc_label.setText(descriptions[idx])
+
+    @property
+    def preset_key(self) -> str:
+        keys = ["blender", "unity", "unreal", "godot", "all_engines", "web"]
+        return keys[self.preset_combo.currentIndex()]
+
+    @property
+    def output_dir(self) -> str:
+        return self.dir_edit.text()
+
+    @property
+    def base_name(self) -> str:
+        return self.name_edit.text().strip() or "hdri_environment"
+
